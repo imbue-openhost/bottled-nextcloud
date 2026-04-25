@@ -14,9 +14,20 @@
 # entrypoint doesn't touch them again.  We re-stamp them every
 # boot so they track operator changes.
 
-set -euo pipefail
+# Note: we deliberately do NOT use ``set -e`` here.  Failures in this
+# hook (transient occ command issues, db not yet ready, …) would
+# otherwise crash apache's startup and put the container into a
+# restart loop.  A failure to re-stamp these settings is recoverable
+# (the previous values stay in place) so we log+continue rather than
+# abort.
+set -uo pipefail
 
 log() { printf '[before-starting] %s\n' "$*" >&2; }
+
+# Always succeed — we never want a re-stamp failure to keep apache
+# from starting.  Operators monitoring the container log will see
+# the [before-starting] FAILED line.
+trap 'log "exited with code $? (continuing anyway)"; exit 0' EXIT
 
 # If Nextcloud isn't installed yet, the post-installation hook hasn't
 # run and we have no config to update.  Bail silently — the
@@ -27,8 +38,19 @@ if [[ ! -f /var/www/html/config/config.php ]]; then
     exit 0
 fi
 
+# The upstream Nextcloud entrypoint already runs hooks as the
+# ``www-data`` user (see /entrypoint.sh `run_as` / `run_path`).  We
+# therefore invoke ``php`` directly without an extra user switch — a
+# ``runuser`` here would fail with "may not be used by non-root
+# users".  Some upstream image variants do run hooks as root, so to
+# be portable we detect the current uid and elide the user switch
+# only when we're already www-data.
 occ() {
-    runuser -u www-data -- php /var/www/html/occ "$@"
+    if [[ "$(id -u)" == "0" ]]; then
+        runuser -u www-data -- php /var/www/html/occ "$@"
+    else
+        php /var/www/html/occ "$@"
+    fi
 }
 
 DOMAIN="${OPENHOST_NEXTCLOUD_DOMAIN:-}"

@@ -26,8 +26,18 @@ log() { printf '[post-installation] %s\n' "$*" >&2; }
 # ``runuser`` rather than ``su`` so the environment is preserved
 # (NEXTCLOUD_ADMIN_USER, etc).  ``--`` separates runuser args from
 # the command's args.
+# The upstream Nextcloud entrypoint already runs hooks as the
+# ``www-data`` user (see /entrypoint.sh `run_as` / `run_path`); a
+# ``runuser`` here would error with "may not be used by non-root
+# users".  Detect the current uid and only switch user when we're
+# running as root.  This makes the script portable to upstream
+# image variants that run hooks as root.
 occ() {
-    runuser -u www-data -- php /var/www/html/occ "$@"
+    if [[ "$(id -u)" == "0" ]]; then
+        runuser -u www-data -- php /var/www/html/occ "$@"
+    else
+        php /var/www/html/occ "$@"
+    fi
 }
 
 ADMIN_USER="${NEXTCLOUD_ADMIN_USER:-admin}"
