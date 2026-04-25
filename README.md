@@ -15,7 +15,11 @@ app, with single sign-on via the OpenHost zone's `zone_auth` cookie.
   - tini as PID 1 to reap zombies and forward signals
 - Persistent state under `$OPENHOST_APP_DATA_DIR`:
   - `pgdata/` — PostgreSQL cluster
-  - `redis/` — Redis dump (currently disabled; `appendonly no`)
+  - `redis/` — Redis on-disk dump directory.  Both AOF
+    (`appendonly no`) AND RDB snapshots (`save ""`) are disabled in
+    the generated redis.conf, so this directory typically stays
+    empty — Redis is used as a non-persistent cache + file lock
+    backend only.
   - The Nextcloud upstream image's standard volumes
     (`/var/www/html/data`, `/var/www/html/config`, custom apps, etc.)
     are bind-mounted under the upstream image's own paths, which are
@@ -31,9 +35,9 @@ app, with single sign-on via the OpenHost zone's `zone_auth` cookie.
   - `admin_password.txt` — chmod 644, the bootstrap admin
     Nextcloud account's password.  Same regeneration rules as
     `.postgres_password`.
-- `[runtime.container]` requests 1.5 GiB / 1.5 cores. Bump
-  `memory_mb` in `openhost.toml` if you run heavy workloads (Talk,
-  OnlyOffice, large preview backlogs).
+- `[resources]` in `openhost.toml` requests 1.5 GiB / 1.5 cores.
+  Bump `memory_mb` if you run heavy workloads (Talk, OnlyOffice,
+  large preview backlogs).
 
 ## Authentication architecture
 
@@ -239,6 +243,6 @@ also know how Nextcloud's first-install flow consumes them.
 │   ├── post-installation/
 │   │   └── 01-openhost-sso.sh        # Install + configure user_saml on first boot
 │   └── before-starting/
-│       └── 00-openhost-overwrite.sh  # Re-stamp trusted_*/overwrite.* every boot
+│       └── 00-openhost-overwrite.sh  # Re-stamp trusted_*/overwrite.* AND user_saml SSO settings every boot
 └── README.md                         # This file.
 ```

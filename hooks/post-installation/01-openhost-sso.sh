@@ -22,16 +22,15 @@ set -euo pipefail
 
 log() { printf '[post-installation] %s\n' "$*" >&2; }
 
-# Run occ as the www-data user under which Apache + PHP run.  We use
-# ``runuser`` rather than ``su`` so the environment is preserved
-# (NEXTCLOUD_ADMIN_USER, etc).  ``--`` separates runuser args from
-# the command's args.
-# The upstream Nextcloud entrypoint already runs hooks as the
-# ``www-data`` user (see /entrypoint.sh `run_as` / `run_path`); a
-# ``runuser`` here would error with "may not be used by non-root
-# users".  Detect the current uid and only switch user when we're
-# running as root.  This makes the script portable to upstream
-# image variants that run hooks as root.
+# Run occ either as ``www-data`` (when the hook itself runs as
+# root) or as the current user (when the hook is already running
+# as ``www-data``, which is what the upstream Nextcloud entrypoint
+# does in its standard runtime).  Detect the uid because some
+# upstream image variants run hooks as root; we want this hook to
+# work both ways without extra configuration.  We prefer
+# ``runuser`` over ``su`` because it preserves the environment
+# (which the upstream entrypoint sets up with NEXTCLOUD_*
+# variables).
 occ() {
     if [[ "$(id -u)" == "0" ]]; then
         runuser -u www-data -- php /var/www/html/occ "$@"

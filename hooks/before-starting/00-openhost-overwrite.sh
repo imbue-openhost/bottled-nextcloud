@@ -45,13 +45,14 @@ if [[ ! -f /var/www/html/config/config.php ]]; then
     exit 0
 fi
 
-# The upstream Nextcloud entrypoint already runs hooks as the
-# ``www-data`` user (see /entrypoint.sh `run_as` / `run_path`).  We
-# therefore invoke ``php`` directly without an extra user switch — a
-# ``runuser`` here would fail with "may not be used by non-root
-# users".  Some upstream image variants do run hooks as root, so to
-# be portable we detect the current uid and elide the user switch
-# only when we're already www-data.
+# Run occ either as ``www-data`` (when the hook itself runs as
+# root) or as the current user (when the hook is already running
+# as ``www-data``, which is what the upstream Nextcloud entrypoint
+# does in its standard runtime).  Detect the uid because some
+# upstream image variants run hooks as root; we want this hook to
+# work both ways without extra configuration.  ``runuser`` errors
+# with "may not be used by non-root users" if we used it
+# unconditionally on non-root, hence the conditional.
 occ() {
     if [[ "$(id -u)" == "0" ]]; then
         runuser -u www-data -- php /var/www/html/occ "$@"

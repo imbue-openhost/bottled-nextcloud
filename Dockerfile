@@ -14,20 +14,27 @@ FROM nextcloud:33-apache
 
 # The official Nextcloud entrypoint runs Apache on port 80.  We move
 # it to 8081 so our auth-sidecar can be the only thing listening on
-# the OpenHost-router-facing port (8080).
+# the OpenHost-router-facing port (8080).  This value is BAKED IN to
+# the Apache config below via ``sed`` and is NOT runtime-configurable
+# — the auth-sidecar reads ``$APACHE_PORT`` to know where to proxy
+# to, so the env var and the Apache config must always agree.  We
+# therefore set the env var here at build time only.  Operators
+# wanting a different port must rebuild the image.
 ENV APACHE_PORT=8081
 
-# Layer Postgres 17 + Redis + Python on top of the trixie base.
+# Layer PostgreSQL + Redis + Python onto the upstream image (which
+# is currently based on Debian Bookworm — that ships PostgreSQL 15,
+# which is what we get).
 #
 # postgresql-client is included so our supervisor shell can probe
 # Postgres readiness with ``pg_isready`` before launching Apache;
 # without it Nextcloud's first-boot ``occ maintenance:install`` would
 # flap if Postgres is still starting.
 #
-# python3 is needed for the auth-sidecar.  cryptography (PyJWT[crypto]
-# transitive) is heavy enough that we install it via apt rather than
-# pip to avoid the build-tool churn — the trixie packages are recent
-# enough.
+# python3 is needed for the auth-sidecar.  Debian's ``python3-jwt``
+# is the PyJWT package (despite the name) — verified at runtime via
+# ``jwt.algorithms.RSAAlgorithm.from_jwk`` etc.  ``python3-requests``
+# and ``python3-cryptography`` are pulled in for the same auth-sidecar.
 #
 # tini gives us a real PID 1 that reaps zombies and forwards signals,
 # matching the supervisor pattern used by openhost-miniflux.
@@ -53,13 +60,16 @@ RUN set -eux; \
     mkdir -p /run/postgresql; \
     chown postgres:postgres /run/postgresql
 
-# Tell Apache to listen on a non-default port.  Apache's default
-# ``Listen 80`` is configured in /etc/apache2/ports.conf, and the
-# default vhost in 000-default.conf uses :80.  We use ``sed`` rather
-# than rewriting the file so future image upgrades that change the
-# stock Apache config keep working.
-RUN sed -i 's/^Listen 80$/Listen 8081/' /etc/apache2/ports.conf; \
-    sed -i 's/<VirtualHost \*:80>/<VirtualHost *:8081>/' /etc/apache2/sites-available/000-default.conf
+# Tell Apache to listen on $APACHE_PORT instead of the default 80.
+# Apache's default ``Listen 80`` is configured in
+# /etc/apache2/ports.conf, and the default vhost in
+# 000-default.conf uses :80.  We use ``sed`` rather than rewriting
+# the file so future image upgrades that change the stock Apache
+# config keep working.  Both ports are derived from $APACHE_PORT
+# (which is set above to 8081) so the Apache config and the
+# auth-sidecar's upstream target agree.
+RUN sed -i "s/^Listen 80$/Listen ${APACHE_PORT}/" /etc/apache2/ports.conf \
+    && sed -i "s/<VirtualHost \*:80>/<VirtualHost *:${APACHE_PORT}>/" /etc/apache2/sites-available/000-default.conf
 
 # Hook scripts: dropped into the directory the upstream entrypoint
 # scans for /docker-entrypoint-hooks.d/{pre,post}-installation/*.sh.

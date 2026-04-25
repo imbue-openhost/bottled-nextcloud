@@ -285,7 +285,12 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
         log.warning("JWKS unavailable; denying owner check: %s", exc)
         return False
     last_error: jwt.PyJWTError | None = None
-    last_non_owner_sub: str | None = None
+    # Sentinel ``False`` distinguishes "we never managed to decode the
+    # JWT against any key" from "we decoded successfully, but the sub
+    # was not 'owner'".  Without the sentinel, ``sub=None`` (a valid
+    # JWT with no sub claim) would log nothing at any level.
+    decode_succeeded = False
+    last_sub: str | None = None
     for key in keys:
         try:
             claims = jwt.decode(
@@ -304,6 +309,7 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
             # while the new key is also published.
             last_error = exc
             continue
+        decode_succeeded = True
         if claims.get("sub") == "owner":
             return True
         # Cryptographically valid token, but the claim isn't
@@ -314,26 +320,25 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
         # told us the right answer (sub doesn't change with key
         # rotation), so this loop will terminate quickly in
         # practice.
-        last_non_owner_sub = claims.get("sub")
-    if last_error is not None or last_non_owner_sub is not None:
-        # Log at DEBUG (not INFO/WARNING) because failed JWT
-        # verifications are common and noisy: any anonymous request
-        # without zone_auth, an expired session, or a third-party
-        # request reaches this path.  Operators investigating "why
-        # can't I log in?" can crank AUTH_PROXY_LOG_LEVEL=DEBUG to
-        # see the per-token failure type (ExpiredSignatureError,
-        # InvalidSignatureError, MissingRequiredClaimError, or
-        # "valid token but sub=foo not owner").
-        if last_non_owner_sub is not None:
-            log.debug(
-                "JWT verified but sub=%r != 'owner'; denying owner check",
-                last_non_owner_sub,
-            )
-        elif last_error is not None:
-            log.debug(
-                "JWT verification failed against all %d JWKS key(s): %s: %s",
-                len(keys), type(last_error).__name__, last_error,
-            )
+        last_sub = claims.get("sub")
+    # Log at DEBUG (not INFO/WARNING) because failed JWT
+    # verifications are common and noisy: any anonymous request
+    # without zone_auth, an expired session, or a third-party
+    # request reaches this path.  Operators investigating "why
+    # can't I log in?" can crank AUTH_PROXY_LOG_LEVEL=DEBUG to
+    # see the per-token failure type (ExpiredSignatureError,
+    # InvalidSignatureError, MissingRequiredClaimError, or
+    # "valid token but sub=X != owner").
+    if decode_succeeded:
+        log.debug(
+            "JWT verified but sub=%r != 'owner'; denying owner check",
+            last_sub,
+        )
+    elif last_error is not None:
+        log.debug(
+            "JWT verification failed against all %d JWKS key(s): %s: %s",
+            len(keys), type(last_error).__name__, last_error,
+        )
     return False
 
 
@@ -930,18 +935,30 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 continue
             break
 
-        # Detect response framing.  We're defensive about
-        # negative or non-integer Content-Length values: a malicious
-        # or buggy upstream could otherwise corrupt our framing
-        # (negative ``_CappedReader`` has remaining=0 and reads
-        # nothing, while we'd echo the negative number to the
-        # client as an invalid header).
+        # Detect response framing.  We're defensive about negative
+        # or non-integer Content-Length values: a malicious or buggy
+        # upstream could otherwise corrupt our framing (negative
+        # ``_CappedReader`` has remaining=0 and reads nothing, while
+        # we'd echo the negative number to the client as an invalid
+        # header).  ``Transfer-Encoding`` per RFC 9110 §6.1 is a
+        # comma-separated list of codings (most commonly just
+        # ``chunked``) and may appear in multiple header lines;
+        # combine all values, split on commas, and check whether
+        # ``chunked`` appears anywhere.  ``chunked``, when present,
+        # MUST be the final coding — but we treat any presence as
+        # "the upstream framed with chunked" because we don't decode
+        # other codings (gzip etc.) and would forward them along
+        # with the chunked frames intact.
         resp_te = ""
+        resp_te_parts: list[str] = []
         resp_cl: int | None = None
         for k, v in resp_headers:
             kl = k.lower()
             if kl == "transfer-encoding":
-                resp_te = v.lower().strip()
+                for token in v.split(","):
+                    token = token.strip().lower()
+                    if token:
+                        resp_te_parts.append(token)
             elif kl == "content-length":
                 try:
                     parsed_cl = int(v.strip())
@@ -956,6 +973,8 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     resp_cl = None
                     continue
                 resp_cl = parsed_cl
+        if "chunked" in resp_te_parts:
+            resp_te = "chunked"
 
         # ---- write status + headers to client ----
         try:
@@ -966,6 +985,19 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     # right framing below based on what we'll
                     # actually send.
                     continue
+                # Defence-in-depth: a compromised or buggy upstream
+                # could include CR/LF in a header value, which would
+                # let it inject arbitrary additional headers
+                # (response header splitting / CRLF injection).
+                # Apache itself doesn't allow this through its own
+                # parser — but the proxy doesn't know what's serving
+                # behind it forever.  Strip CR/LF before forwarding;
+                # legitimate header values do not contain them.
+                if "\r" in v or "\n" in v:
+                    log.warning(
+                        "stripping CR/LF from upstream header %r value", k
+                    )
+                    v = v.replace("\r", "").replace("\n", "")
                 self.send_header(k, v)
             # Mirror the upstream's framing back to the client.
             if status_code in (204, 304):

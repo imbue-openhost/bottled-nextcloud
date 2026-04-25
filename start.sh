@@ -86,12 +86,25 @@ log "DATA_DIR=$DATA_DIR"
 # ---------------------------------------------------------------------
 load_or_generate() {
     local file="$1"
-    local current
+    local current head_rc
     if [[ -s "$file" ]]; then
         # Strip any trailing newline that openssl adds.  Don't read
         # multi-line files: a corrupted password file with embedded
         # newlines would otherwise feed garbage into postgres.
-        current=$(head -n1 "$file" | tr -d '\r\n')
+        #
+        # We capture head's exit code separately so a permission /
+        # read failure surfaces as a FATAL error rather than silently
+        # producing an empty ``current`` and unsafely regenerating
+        # the password (which would de-sync our file from postgres'
+        # role password and break every subsequent connection).
+        current=$(head -n1 "$file" 2>/dev/null)
+        head_rc=$?
+        if [[ "$head_rc" -ne 0 ]]; then
+            log "FATAL: failed to read $file (head exit $head_rc); not regenerating to avoid file/db drift"
+            log "  if the file is genuinely corrupt, delete it and re-run; otherwise check permissions"
+            exit 1
+        fi
+        current=$(printf '%s' "$current" | tr -d '\r\n')
         if [[ -n "$current" ]]; then
             printf '%s' "$current"
             return
