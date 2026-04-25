@@ -198,15 +198,18 @@ provision_db() {
     db_exists=$(su postgres -c "psql -h /run/postgresql -tAc \"SELECT 1 FROM pg_database WHERE datname='nextcloud'\"" 2>/dev/null || true)
     role_exists=$(su postgres -c "psql -h /run/postgresql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='nextcloud'\"" 2>/dev/null || true)
 
+    # Send the SQL (which carries the plaintext password) via stdin
+    # instead of the ``-c`` argument so the password never appears in
+    # ``/proc/<pid>/cmdline``.  ``psql -f -`` reads SQL from stdin.
+    # We escape any single-quote in the password by doubling it (the
+    # standard SQL literal escape).  ``ON_ERROR_STOP=1`` ensures
+    # psql exits non-zero on any SQL error.
+    local escaped_pw="${POSTGRES_PASSWORD//\'/\'\'}"
+
     if [[ "$role_exists" != "1" ]]; then
         log "creating nextcloud role"
-        # We pass the password via an env var + psql ``\set`` so it
-        # doesn't end up on the command line (visible in
-        # /proc/<pid>/cmdline) or in postgres' ``log_statement=all``
-        # logs (which we don't enable, but defence in depth).
-        local sql
-        sql="$(printf "CREATE ROLE nextcloud LOGIN PASSWORD '%s';" "${POSTGRES_PASSWORD//\'/\'\'}")"
-        if ! su postgres -c "psql -h /run/postgresql -v ON_ERROR_STOP=1 -c \"$sql\"" >/dev/null; then
+        if ! printf "CREATE ROLE nextcloud LOGIN PASSWORD '%s';\n" "$escaped_pw" \
+                | su postgres -c "psql -h /run/postgresql -v ON_ERROR_STOP=1 -f -" >/dev/null; then
             log "FATAL: failed to create nextcloud role"
             return 1
         fi
@@ -215,10 +218,16 @@ provision_db() {
         # password rotation (operator hand-edits the side file)
         # propagates on next boot.  The check above means we always
         # reach this branch when the role already exists.
-        local sql
-        sql="$(printf "ALTER ROLE nextcloud WITH PASSWORD '%s';" "${POSTGRES_PASSWORD//\'/\'\'}")"
-        if ! su postgres -c "psql -h /run/postgresql -v ON_ERROR_STOP=1 -c \"$sql\"" >/dev/null; then
-            log "warning: failed to ALTER nextcloud role password (continuing with existing password)"
+        #
+        # If ALTER fails we abort the boot — continuing would leave
+        # the password file out of sync with the database role, and
+        # every subsequent Nextcloud connection would 500 with an
+        # authentication error.  Better to fail loudly here so the
+        # operator can investigate.
+        if ! printf "ALTER ROLE nextcloud WITH PASSWORD '%s';\n" "$escaped_pw" \
+                | su postgres -c "psql -h /run/postgresql -v ON_ERROR_STOP=1 -f -" >/dev/null; then
+            log "FATAL: failed to ALTER nextcloud role password — file/db now out of sync; aborting boot"
+            return 1
         fi
     fi
 
@@ -264,31 +273,60 @@ PG_WATCHDOG_PID=""
 # Trap BEFORE any backgrounding so a SIGTERM that arrives during the
 # small race window between ``&`` and the trap line doesn't use bash's
 # default handler and orphan our children.
+#
+# The trap is registered for TERM/INT (signal-driven shutdown), and
+# also for EXIT so that any ``exit 1`` path (Apache failed to bind,
+# Redis didn't become ready, etc.) tears Postgres down too instead of
+# leaking it as an orphan — Postgres is started via ``pg_ctl`` so it's
+# not a direct child of this shell.
+TERMINATING=0
 cleanup() {
-    log "received signal; tearing down"
+    # Make cleanup idempotent: a SIGTERM may fire and also trip the
+    # EXIT trap as the shell shuts down.  Without a guard we'd send
+    # two rounds of SIGTERMs and stop postgres twice.
+    if [[ "$TERMINATING" == "1" ]]; then
+        return
+    fi
+    TERMINATING=1
+    log "tearing down"
     kill -TERM ${APACHE_PID:-} ${PROXY_PID:-} ${REDIS_PID:-} \
               ${PG_WATCHDOG_PID:-} 2>/dev/null || true
     # Also stop postgres explicitly (it's not a direct child).
     su postgres -c "$PG_BIN/pg_ctl stop -D '$PG_DATA' -m fast" 2>/dev/null || true
     wait 2>/dev/null || true
 }
-trap cleanup TERM INT
+trap cleanup TERM INT EXIT
 
 log "starting redis"
 redis-server "$REDIS_CONF" &
 REDIS_PID=$!
 
-# Wait for redis to bind.
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+# Wait for redis to be READY (responding to PING), not just alive.
+# A slow-starting Redis would otherwise pass a kill -0 liveness check
+# while still rejecting connections, causing Nextcloud's first cache
+# / file-locking calls to fail.  Apache's readiness loop uses the
+# same flag-based pattern.
+REDIS_READY_TIMEOUT="${REDIS_READY_TIMEOUT:-30}"
+redis_ready=0
+for _ in $(seq 1 "$REDIS_READY_TIMEOUT"); do
     if redis-cli -s /run/redis/redis.sock ping 2>/dev/null | grep -q PONG; then
+        redis_ready=1
         break
     fi
-    sleep 0.3
+    if ! kill -0 "$REDIS_PID" 2>/dev/null; then
+        log "FATAL: redis died during startup"
+        wait "$REDIS_PID" || true
+        exit 1
+    fi
+    sleep 1
 done
-if ! kill -0 "$REDIS_PID" 2>/dev/null; then
-    log "FATAL: redis died during startup"
+if [[ "$redis_ready" != "1" ]]; then
+    log "FATAL: redis did not respond to PING within ${REDIS_READY_TIMEOUT}s"
+    kill -TERM "$REDIS_PID" 2>/dev/null || true
+    wait "$REDIS_PID" || true
     exit 1
 fi
+log "redis is ready"
 
 # ---------------------------------------------------------------------
 # Configure Nextcloud env so the upstream entrypoint runs install/upgrade
@@ -414,7 +452,5 @@ EXIT_CODE=$?
 set -e
 
 log "child exited (code=$EXIT_CODE); stopping container"
-kill -TERM "$APACHE_PID" "$PROXY_PID" "$REDIS_PID" "$PG_WATCHDOG_PID" 2>/dev/null || true
-su postgres -c "$PG_BIN/pg_ctl stop -D '$PG_DATA' -m fast" 2>/dev/null || true
-wait || true
+# The EXIT trap handles teardown; just exit with the right code.
 exit "$EXIT_CODE"

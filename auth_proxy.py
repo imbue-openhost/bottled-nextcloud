@@ -14,18 +14,25 @@ Sits between the OpenHost router and Apache+Nextcloud.  Two distinct rails:
    header as the authenticated user — auto-creating the account on
    first login.
 
-2. Native sync clients (Desktop / Android / iOS / WebDAV CLIs) —
-   pair through Login Flow v2 in the system browser, mint an
-   ``app password``, then carry that as HTTP Basic Auth on
-   subsequent WebDAV / OCS requests.  Those requests do NOT carry
-   zone_auth (the system browser session is separate from the sync
-   client's process) so we cannot SSO them.  Instead we let any
-   request to ``/remote.php/dav/*``, ``/remote.php/webdav/*``,
-   ``/ocs/*``, ``/status.php``, ``/.well-known/*``,
-   ``/login/v2*``, ``/index.php/login/v2*`` pass through with the
+2. Native sync clients (Desktop / Android / iOS / WebDAV CLIs) and a
+   handful of anonymous / Basic-Auth endpoints — pair through Login
+   Flow v2 in the system browser, mint an ``app password``, then
+   carry that as HTTP Basic Auth on subsequent requests.  The
+   authoritative bypass list is ``PUBLIC_PATH_PATTERNS`` below;
+   it covers WebDAV (``/remote.php/dav/*``, ``/remote.php/webdav/*``,
+   plus the legacy ``/caldav`` and ``/carddav`` aliases), OCS
+   (``/ocs/*``), Login Flow v2 (``/login/v2*`` and
+   ``/index.php/login/v2*``), well-known service endpoints
+   (``/.well-known/*``, ``/status.php``), public file shares
+   (``/s/<id>``, ``/index.php/s/<id>``, ``/public.php``,
+   ``/index.php/public.php``), and the CSRF-token bootstrap
+   endpoints (``/csrftoken``, ``/index.php/csrftoken``).
+   Requests on any of these paths pass through with their
    ``Authorization`` header intact and NO ``X-Openhost-User`` header
-   stamped — Nextcloud authenticates them via the app-password
-   directly.
+   stamped — Nextcloud authenticates them via the app-password (or
+   share token / anonymous public access) directly.  Refer to
+   ``PUBLIC_PATH_PATTERNS`` as the source of truth; this docstring
+   is a summary that may drift.
 
 Why public_paths = ["/"] in openhost.toml then?  Because the OpenHost
 router treats public_paths as "no zone_auth required AND don't strip
@@ -33,20 +40,23 @@ client-supplied X-Openhost-Is-Owner header".  We want the router to
 let ALL requests reach us so we can enforce the two-rail logic in
 this sidecar instead.  See the openhost.toml comments and the README.
 
-We deliberately strip any client-supplied X-Openhost-User header
-on protected paths so a hostile request can't inject an identity
-the JWT didn't authorise.  The ``user_saml`` env-variable
-authenticator will only see the value WE stamp.
+We deliberately strip any client-supplied X-Openhost-User AND
+X-OpenHost-Is-Owner headers on EVERY request — including public
+paths — so a hostile request can't inject an identity the JWT
+didn't authorise.  The ``user_saml`` env-variable authenticator
+will only see the value WE stamp.
 
 Streaming:  Nextcloud serves and accepts files of arbitrary size,
 so unlike miniflux's auth-proxy we MUST stream bodies in both
-directions rather than buffer them in memory.  We use raw sockets +
-http.client for the upstream side and copy bytes block-by-block.
+directions rather than buffer them in memory.  We use raw sockets
+plus the ``socket.makefile`` API to copy bytes block-by-block; the
+``http.client`` library is intentionally NOT used for upstream I/O
+because its response-buffering model would defeat the streaming
+goal.
 """
 
 from __future__ import annotations
 
-import http.client
 import logging
 import os
 import re
@@ -204,9 +214,17 @@ class JwksCache:
                 log.warning("JWKS fetch failed and no cache: %s", exc)
                 raise
 
+            # Update both fields atomically while holding the cache
+            # lock.  Order matters: we set ``_fetched_at`` BEFORE
+            # ``_keys`` so a concurrent reader observing the new
+            # ``_keys`` is guaranteed to also see the matching
+            # ``_fetched_at`` — the alternative ordering can leave
+            # a thread thinking the brand-new keys are stale and
+            # immediately scheduling another refresh.
+            now = time.time()
             with self._cache_lock:
+                self._fetched_at = now
                 self._keys = keys
-                self._fetched_at = time.time()
             log.info("refreshed JWKS (%d key(s))", len(keys))
             return keys
 
@@ -540,36 +558,80 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     ) -> None:
         """Write the request to upstream and copy the response back.
 
-        We talk raw HTTP/1.1 to upstream rather than going through
-        http.client so we can stream the response body without
-        forcing http.client to buffer it.  The response framing
-        (chunked vs Content-Length vs connection-close) is detected
-        from the upstream's headers and copied to the client
-        verbatim.
+        We talk raw HTTP/1.1 to upstream and stream the response body
+        without buffering it.  The response framing (chunked vs
+        Content-Length vs connection-close) is detected from the
+        upstream's headers and copied to the client verbatim.
         """
         upstream_sock.settimeout(STREAM_TIMEOUT_SECONDS)
         upstream_writer = upstream_sock.makefile("wb", buffering=0)
         upstream_reader = upstream_sock.makefile("rb", buffering=STREAM_CHUNK_BYTES)
 
+        try:
+            self._stream_inner(
+                upstream_sock,
+                upstream_writer,
+                upstream_reader,
+                cleaned_headers,
+                body_mode,
+                body_length,
+            )
+        finally:
+            # ``socket.makefile()`` duplicates the FD via ``socket.dup()``
+            # internally, so closing the raw socket alone leaks the
+            # duplicates.  Close both file objects here and let the
+            # caller's finally close the underlying socket.
+            for f in (upstream_writer, upstream_reader):
+                try:
+                    f.close()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _encode_header_bytes(value: str) -> bytes:
+        """Encode a header line value to bytes for the wire.
+
+        HTTP headers are octets; ``latin-1`` is the canonical encoding
+        for Python strings ↔ HTTP header bytes round-tripping (the
+        same encoding ``http.server`` and ``http.client`` use).
+        Non-latin-1 code points (e.g. a UTF-8 cookie set by a buggy
+        client) would otherwise raise ``UnicodeEncodeError`` and tear
+        down the connection.  We replace such code points with ``?``
+        so the request still goes through, log a warning, and let
+        Apache decide how to react.
+        """
+        try:
+            return value.encode("latin-1")
+        except UnicodeEncodeError:
+            log.warning("non-latin-1 header value, replacing offending bytes")
+            return value.encode("latin-1", errors="replace")
+
+    def _stream_inner(
+        self,
+        upstream_sock: socket.socket,
+        upstream_writer,
+        upstream_reader,
+        cleaned_headers: list[tuple[str, str]],
+        body_mode: str,
+        body_length: int,
+    ) -> None:
         # ---- write request line + headers ----
         # The request-target is exactly what the client sent, including
         # query string.  ``self.path`` already has it.  Per RFC 9110
         # §3.2 the request-target on an origin-form URL is the
         # ``absolute-path [ "?" query ]`` part.
         request_line = f"{self.command} {self.path} HTTP/1.1\r\n"
-        upstream_writer.write(request_line.encode("latin-1"))
-        # Always send a Host header — http.client would have done
-        # this for us but we're talking raw bytes now.
+        upstream_writer.write(self._encode_header_bytes(request_line))
+        # Always send a Host header.
         upstream_writer.write(
-            f"Host: {self.upstream_host}:{self.upstream_port}\r\n".encode("latin-1")
+            self._encode_header_bytes(
+                f"Host: {self.upstream_host}:{self.upstream_port}\r\n"
+            )
         )
         for key, value in cleaned_headers:
-            # Latin-1 is HTTP/1.1's header byte encoding.  PyJWT and
-            # parsers reject non-ASCII anyway, so we won't see any
-            # input that latin-1 can't represent in practice — and if
-            # we did, we'd have already corrupted the data on the way
-            # in.
-            upstream_writer.write(f"{key}: {value}\r\n".encode("latin-1"))
+            upstream_writer.write(
+                self._encode_header_bytes(f"{key}: {value}\r\n")
+            )
         # Re-state the framing.  We dropped the original
         # Content-Length / Transfer-Encoding via HOP_BY_HOP_HEADERS
         # so re-add the right one for the upstream.
@@ -635,8 +697,15 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             return
 
         # ---- read response status + headers ----
+        # 64 KiB is generous: an HTTP-spec status-line tops out around
+        # 1 KiB even for the longest reason phrase, so anything bigger
+        # is likely a client/upstream confusion that we should bail on.
+        # Individual response headers (e.g. a long Set-Cookie carrying
+        # a JWT, or a giant Link rel=preload) can legitimately be a
+        # few KiB; the same 64 KiB cap covers them all.
+        HEADER_LINE_CAP = 64 * 1024
         try:
-            status_line = upstream_reader.readline(8192)
+            status_line = upstream_reader.readline(HEADER_LINE_CAP)
         except OSError as exc:
             log.warning("upstream read status failed: %s", exc)
             self._safe_send_error(502, "Bad Gateway")
@@ -644,6 +713,14 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         if not status_line:
             log.warning("upstream closed before sending status line")
             self._safe_send_error(502, "Bad Gateway")
+            return
+        # ``readline(N)`` returns up to N bytes; if it didn't end in a
+        # newline, the line was truncated and the stream is in an
+        # ambiguous state (subsequent ``readline`` would interpret the
+        # remainder of the over-long line as a new entry).  Bail.
+        if not status_line.endswith((b"\n",)):
+            log.warning("upstream status line exceeds %d bytes", HEADER_LINE_CAP)
+            self._safe_send_error(502, "upstream status line too long")
             return
 
         try:
@@ -664,38 +741,47 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             return
         reason = parts[2] if len(parts) > 2 else ""
 
-        # Read response headers until blank line.
-        resp_headers: list[tuple[str, str]] = []
-        last_header: list[str] | None = None
+        # Read response headers until blank line.  We store entries as
+        # mutable two-element lists so RFC 9110 §5.2 obsolete
+        # line-folding (which appends to the previous header) actually
+        # mutates the entry stored in ``resp_headers``, not just a
+        # dangling reference.  Earlier versions of this code used
+        # tuples, which silently lost folded continuations.
+        resp_headers: list[list[str]] = []
         while True:
             try:
-                line = upstream_reader.readline(8192)
+                line = upstream_reader.readline(HEADER_LINE_CAP)
             except OSError as exc:
                 log.warning("upstream read header failed: %s", exc)
                 self._safe_send_error(502, "Bad Gateway")
                 return
             if not line or line in (b"\r\n", b"\n"):
                 break
+            if not line.endswith((b"\n",)):
+                log.warning(
+                    "upstream header line exceeds %d bytes",
+                    HEADER_LINE_CAP,
+                )
+                self._safe_send_error(502, "upstream header too long")
+                return
             try:
                 decoded = line.decode("latin-1").rstrip("\r\n")
             except UnicodeDecodeError:
                 log.warning("upstream header not latin-1")
                 self._safe_send_error(502, "Bad Gateway")
                 return
-            # RFC 9110 §5.2 obsolete line-folding: continuation lines
-            # start with whitespace and append to the previous header.
-            # Apache won't send these but be defensive.
-            if line[:1] in (b" ", b"\t") and last_header is not None:
-                last_header[1] = last_header[1] + " " + decoded.strip()
+            # Continuation lines start with whitespace; append to the
+            # previous header's value (mutating the entry in
+            # ``resp_headers`` because we hold a reference).
+            if line[:1] in (b" ", b"\t") and resp_headers:
+                resp_headers[-1][1] = resp_headers[-1][1] + " " + decoded.strip()
                 continue
             if ":" not in decoded:
                 # Skip malformed lines silently — http.client does the
                 # same.
                 continue
             name, _, value = decoded.partition(":")
-            entry = [name.strip(), value.strip()]
-            resp_headers.append((entry[0], entry[1]))
-            last_header = entry
+            resp_headers.append([name.strip(), value.strip()])
 
         # Detect response framing.
         resp_te = ""
@@ -721,12 +807,21 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     continue
                 self.send_header(k, v)
             # Mirror the upstream's framing back to the client.
-            if status_code in (204, 304) or self.command == "HEAD":
-                # No response body; framing-irrelevant per RFC 9110.
-                # Do NOT send Content-Length (HEAD's CL is the size
-                # of the body a GET would return — we already
-                # forwarded it from the upstream above).
+            if status_code in (204, 304):
+                # 204/304 MUST NOT have a body and have no Content-Length
+                # (RFC 9110 §15.3.5 / §15.4.5).  Skip framing entirely.
                 pass
+            elif self.command == "HEAD":
+                # HEAD responses MUST NOT include a message body, but
+                # MUST include the same Content-Length the equivalent
+                # GET would (RFC 9110 §9.3.2).  We dropped the
+                # upstream's Content-Length above as a hop-by-hop
+                # header so we have to re-add it here.  If upstream
+                # used chunked, we report nothing (HEAD bodies aren't
+                # chunked-framed and there's no Content-Length to
+                # propagate).
+                if resp_cl is not None:
+                    self.send_header("Content-Length", str(resp_cl))
             elif resp_te == "chunked":
                 self.send_header("Transfer-Encoding", "chunked")
             elif resp_cl is not None:
@@ -765,17 +860,18 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         We don't decode the chunks — the encoding is preserved
         end-to-end — but we DO need to detect the terminating
         ``0\\r\\n\\r\\n`` chunk so we know when the body ends.
-
-        This is necessary because our caller multiplexes multiple
-        request bodies on the same connection in principle; in
-        practice we use Connection: close upstream, but the same
-        helper handles the response side too where Apache may keep
-        the connection open across responses if we let it.
         """
         # Read the chunk-size line, write it through, read that
         # many bytes plus the trailing CRLF, write through, repeat
         # until size is 0; then read trailers (zero or more header
         # lines terminated by blank line) and write through.
+        #
+        # Cap the number of "tolerated" stray blank lines so a
+        # malicious or buggy source streaming nothing but ``\r\n``
+        # cannot pin a handler thread for the full
+        # STREAM_TIMEOUT_SECONDS.
+        MAX_BLANK_LINES = 8
+        blank_lines_seen = 0
         while True:
             size_line = src.readline(8192)
             if not size_line:
@@ -786,9 +882,19 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             # Strip any chunk-extensions after a ``;``.
             decoded = size_line.split(b";", 1)[0].strip()
             if not decoded:
-                # Tolerate a stray blank line at the start (Apache
-                # doesn't send these but be defensive).
+                # Tolerate a stray blank line at the start (RFC
+                # tolerance for "be liberal in what you accept"), but
+                # cap the count so an infinite stream of blank lines
+                # can't spin forever.
+                blank_lines_seen += 1
+                if blank_lines_seen > MAX_BLANK_LINES:
+                    log.warning(
+                        "too many blank chunk-size lines (%d); aborting stream",
+                        blank_lines_seen,
+                    )
+                    return
                 continue
+            blank_lines_seen = 0
             try:
                 size = int(decoded, 16)
             except ValueError:
@@ -812,10 +918,16 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     return
                 dst.write(chunk)
                 remaining -= len(chunk)
-            # CRLF after each chunk.
-            crlf = src.read(2)
-            if not crlf:
-                return
+            # CRLF after each chunk.  ``read(2)`` on a buffered
+            # socket file is NOT guaranteed to return exactly 2
+            # bytes — it can return 1 if the TCP segment splits at
+            # the boundary.  Loop until we have both bytes (or EOF).
+            crlf = b""
+            while len(crlf) < 2:
+                more = src.read(2 - len(crlf))
+                if not more:
+                    return
+                crlf += more
             dst.write(crlf)
 
 

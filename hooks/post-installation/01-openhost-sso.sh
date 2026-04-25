@@ -43,43 +43,85 @@ occ() {
 ADMIN_USER="${NEXTCLOUD_ADMIN_USER:-admin}"
 
 log "installing user_saml app"
-# ``app:install`` errors if the app is already installed.  Detect the
-# state first via ``app:list``.
-if occ --no-warnings app:list --output=json 2>/dev/null \
-        | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if "user_saml" in (d.get("enabled") or {}) or "user_saml" in (d.get("disabled") or {}) else 1)'; then
-    log "user_saml already present; skipping install"
-else
-    occ --no-warnings app:install user_saml || {
-        # Fall back to enabling if install reports already-installed.
-        log "app:install user_saml failed; trying app:enable"
-        occ --no-warnings app:enable user_saml
-    }
-fi
-occ --no-warnings app:enable user_saml
-
-# user_saml stores configs in indexed slots starting at 1.  We always
-# operate on slot 1 since this is a single-IdP deployment.  ``saml:config:create``
-# is idempotent in the sense that calling it twice creates two configs;
-# guard by checking for an existing one.
-log "configuring user_saml environment-variable mode"
-SAML_CONFIG_ID=""
-# saml:config:list is added in user_saml >= 5.x.  Older versions
-# require querying the config table directly.  Try the modern path
-# first; fall back to creating fresh.
-if occ --no-warnings saml:config:list --output=json 2>/dev/null > /tmp/saml_configs.json; then
-    SAML_CONFIG_ID=$(python3 -c '
+# Probe the current state of user_saml first.  Three cases:
+#   * already enabled  → nothing to do for the install/enable phase
+#   * installed but disabled  → just ``app:enable``
+#   * not present  → ``app:install`` (which auto-enables in v33)
+#
+# Without this probe, calling ``app:enable`` unconditionally on an
+# already-enabled app raises a non-zero exit on Nextcloud >= 25
+# without ``--force``, which under ``set -e`` would abort the whole
+# hook before any saml:config:set calls run.
+SAML_STATE=""
+SAML_LIST_JSON=$(occ --no-warnings app:list --output=json 2>/dev/null || echo '{}')
+SAML_STATE=$(printf '%s' "$SAML_LIST_JSON" | python3 -c '
 import json, sys
 try:
-    data = json.load(open("/tmp/saml_configs.json"))
+    data = json.load(sys.stdin)
 except Exception:
+    sys.exit(0)
+if isinstance(data, dict):
+    if "user_saml" in (data.get("enabled") or {}):
+        print("enabled")
+    elif "user_saml" in (data.get("disabled") or {}):
+        print("disabled")
+' 2>/dev/null || true)
+
+case "$SAML_STATE" in
+    enabled)
+        log "user_saml already enabled; skipping install/enable"
+        ;;
+    disabled)
+        log "user_saml disabled; enabling"
+        occ --no-warnings app:enable user_saml
+        ;;
+    *)
+        log "user_saml not present; installing"
+        occ --no-warnings app:install user_saml
+        ;;
+esac
+
+# user_saml stores configs in indexed slots starting at 1.  We always
+# operate on slot 1 since this is a single-IdP deployment.
+# ``saml:config:create`` would create a fresh slot every time it's
+# called; guard by checking for an existing one first.
+log "configuring user_saml environment-variable mode"
+SAML_CONFIG_ID=""
+# Stage to a tempfile we own and clean up on script exit so a crash
+# mid-script doesn't leave files behind in /tmp.
+SAML_TMP=""
+if SAML_TMP=$(mktemp 2>/dev/null) && [[ -n "$SAML_TMP" ]]; then
+    trap 'rm -f "$SAML_TMP" 2>/dev/null || true' EXIT
+fi
+# ``saml:config:list`` is added in user_saml >= 5.x.  Older versions
+# require querying the config table directly.  Try the modern path
+# first; on JSON-parse error or unexpected output we fall through to
+# ``saml:config:create``, which is the safe default.  We log a
+# warning if the JSON failed to parse so an operator can investigate
+# instead of silently winding up with a duplicate config slot.
+if [[ -n "$SAML_TMP" ]] \
+        && occ --no-warnings saml:config:list --output=json > "$SAML_TMP" 2>/dev/null; then
+    PARSE_OUT=$(python3 -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception as exc:
+    sys.stderr.write(f"PARSE_ERROR:{exc}\n")
     sys.exit(0)
 if isinstance(data, dict) and data:
     print(next(iter(data.keys())))
 elif isinstance(data, list) and data:
     # Some versions return [{"id": 1}, ...]
-    print(data[0].get("id", ""))
-' 2>/dev/null || true)
-    rm -f /tmp/saml_configs.json
+    item = data[0]
+    if isinstance(item, dict):
+        print(item.get("id", ""))
+' "$SAML_TMP" 2>&1 || true)
+    if printf '%s' "$PARSE_OUT" | grep -q "^PARSE_ERROR:"; then
+        log "warning: saml:config:list output unparseable; falling back to fresh config"
+        log "  $PARSE_OUT"
+    else
+        SAML_CONFIG_ID=$(printf '%s' "$PARSE_OUT" | tr -d '\n')
+    fi
 fi
 if [[ -z "$SAML_CONFIG_ID" ]]; then
     log "creating fresh user_saml config"

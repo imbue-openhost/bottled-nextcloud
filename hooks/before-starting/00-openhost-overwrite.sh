@@ -61,31 +61,57 @@ fi
 
 log "re-stamping overwrite.* and trusted_* for $DOMAIN"
 
-# trusted_domains is an indexed list.  We always set index 0 to the
-# public domain and index 1 to ``localhost`` for in-container
-# health-check probes.
-occ --no-warnings config:system:set trusted_domains 0 --value="$DOMAIN"
-occ --no-warnings config:system:set trusted_domains 1 --value="localhost"
-occ --no-warnings config:system:set trusted_domains 2 --value="127.0.0.1"
+# Helper that wraps an ``occ`` invocation and surfaces failures via
+# our log so a misconfigured database / occ flag drift is visible
+# instead of silently leaving stale config in place.  We don't abort
+# on a single failure (``set -e`` is intentionally off) — partial
+# re-stamp is preferable to a crashed Apache.
+occ_or_warn() {
+    local desc="$1"
+    shift
+    if ! occ --no-warnings "$@" >/dev/null 2>&1; then
+        log "warning: $desc failed (continuing with previous value)"
+        return 1
+    fi
+    return 0
+}
+
+# trusted_domains is an indexed array.  Stale higher indices left
+# from a previous deploy with a different domain would otherwise
+# remain trusted forever — Nextcloud has no built-in TTL.  Delete
+# the whole key first, then re-set the indices we want.  The
+# window between delete and re-set is small (~ms) and runs before
+# Apache binds its listening port, so there are no concurrent
+# requests during it.
+occ_or_warn "config:system:delete trusted_domains" \
+    config:system:delete trusted_domains
+occ_or_warn "config:system:set trusted_domains[0]=$DOMAIN" \
+    config:system:set trusted_domains 0 --value="$DOMAIN"
+occ_or_warn "config:system:set trusted_domains[1]=localhost" \
+    config:system:set trusted_domains 1 --value="localhost"
+occ_or_warn "config:system:set trusted_domains[2]=127.0.0.1" \
+    config:system:set trusted_domains 2 --value="127.0.0.1"
 
 # trusted_proxies: only the auth-sidecar at 127.0.0.1.  Setting more
 # than one here would let any of those addresses inject the
-# X-Openhost-User header — the sidecar is on loopback only.
-occ --no-warnings config:system:set trusted_proxies 0 --value="127.0.0.1"
+# X-Openhost-User header — the sidecar is on loopback only.  Same
+# delete-then-set pattern to clear any stale entries.
+occ_or_warn "config:system:delete trusted_proxies" \
+    config:system:delete trusted_proxies
+occ_or_warn "config:system:set trusted_proxies[0]=127.0.0.1" \
+    config:system:set trusted_proxies 0 --value="127.0.0.1"
 
 # overwrite.cli.url drives URL generation for occ commands and
-# emails.  Match the protocol to the OpenHost zone style.
-case "${OPENHOST_ZONE_DOMAIN:-}" in
-    lvh.me|*.lvh.me|localhost|*.localhost)
-        SCHEME="http"
-        ;;
-    *)
-        SCHEME="https"
-        ;;
-esac
-occ --no-warnings config:system:set overwrite.cli.url --value="${SCHEME}://${DOMAIN}"
-occ --no-warnings config:system:set overwriteprotocol --value="${SCHEME}"
-occ --no-warnings config:system:set overwritehost --value="$DOMAIN"
+# emails.  Prefer ``$OVERWRITEPROTOCOL`` (set by start.sh from the
+# same case statement) over re-deriving the scheme here, so a future
+# change to the dev-domain list lives in one place.
+SCHEME="${OVERWRITEPROTOCOL:-https}"
+occ_or_warn "config:system:set overwrite.cli.url" \
+    config:system:set overwrite.cli.url --value="${SCHEME}://${DOMAIN}"
+occ_or_warn "config:system:set overwriteprotocol" \
+    config:system:set overwriteprotocol --value="${SCHEME}"
+occ_or_warn "config:system:set overwritehost" \
+    config:system:set overwritehost --value="$DOMAIN"
 
 # user_saml's environment-variable mode reads $_SERVER['HTTP_X_OPENHOST_USER'].
 # Re-affirm the mapping every boot in case a future user_saml upgrade
