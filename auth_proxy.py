@@ -950,9 +950,9 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             # WebSocket upgrades through this proxy anyway).
             if 100 <= status_code < 200 and status_code != 101:
                 interim_seen += 1
-                if interim_seen > MAX_INTERIM:
+                if interim_seen >= MAX_INTERIM:
                     log.warning(
-                        "upstream sent more than %d interim responses; aborting",
+                        "upstream sent %d or more interim responses; aborting",
                         MAX_INTERIM,
                     )
                     self._safe_send_error(502, "too many interim responses")
@@ -1157,10 +1157,15 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 return False
             decoded = size_line.split(b";", 1)[0].strip()
             if not decoded:
-                # Stray blank line.  Cap so an infinite stream of
-                # blank lines can't spin forever.  We DO forward
-                # the blank line — it's a tolerated byte sequence,
-                # not a corrupted one.
+                # Stray blank line — RFC 9112 §7.1 doesn't permit
+                # blank lines between chunks, but we tolerate up to
+                # ``_CHUNKED_MAX_BLANK_LINES`` of them as a "be
+                # liberal in what you accept" gesture.  We do NOT
+                # forward them: Apache (and most other downstream
+                # parsers) would try to parse a forwarded blank line
+                # as a chunk-size token and reject the entire
+                # response.  Silently consuming them lets the
+                # upstream's well-formed chunks through unchanged.
                 blank_lines_seen += 1
                 if blank_lines_seen > self._CHUNKED_MAX_BLANK_LINES:
                     log.warning(
@@ -1168,7 +1173,6 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                         blank_lines_seen,
                     )
                     return False
-                dst.write(size_line)
                 continue
             try:
                 size = int(decoded, 16)

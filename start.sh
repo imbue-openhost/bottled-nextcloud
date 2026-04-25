@@ -455,9 +455,9 @@ apache_ready=0
 for _ in $(seq 1 "$APACHE_READY_TIMEOUT"); do
     if APACHE_PORT="${APACHE_PORT:-8081}" python3 -c '
 import os, socket, sys
-s = socket.socket()
-s.settimeout(0.5)
-sys.exit(0 if s.connect_ex(("127.0.0.1", int(os.environ["APACHE_PORT"]))) == 0 else 1)
+with socket.socket() as s:
+    s.settimeout(0.5)
+    sys.exit(0 if s.connect_ex(("127.0.0.1", int(os.environ["APACHE_PORT"]))) == 0 else 1)
 ' 2>/dev/null; then
         log "apache is listening"
         apache_ready=1

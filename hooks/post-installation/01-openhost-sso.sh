@@ -129,11 +129,20 @@ if [[ -z "$SAML_CONFIG_ID" ]]; then
     # entirety of stdout (just a number, no decoration).  Capture
     # both stdout and stderr separately so that a failure (DB
     # error, missing user_saml app, ...) shows up in the log as a
-    # diagnostic line, rather than silently falling back to slot 1
-    # with no clue why.
+    # diagnostic line.  We treat a non-numeric output as a hard
+    # failure (exit 1) rather than silently falling back to slot
+    # 1 — the design intent of this hook (top-of-file comment) is
+    # to fail loudly so an operator can fix the cause; a partial
+    # SSO setup that quietly bypasses user_saml is worse than a
+    # restart loop the operator can investigate.
     CREATE_ERR=""
     CREATE_ERR=$(mktemp 2>/dev/null) || CREATE_ERR=""
+    # Register the new tempfile with the EXIT trap so it's cleaned
+    # up on any abnormal termination, matching the SAML_TMP pattern
+    # above.  We update the trap rather than installing a second
+    # one because bash only supports one EXIT trap.
     if [[ -n "$CREATE_ERR" ]]; then
+        trap 'rm -f "$SAML_TMP" "$CREATE_ERR" 2>/dev/null || true' EXIT
         NEW_ID=$(occ --no-warnings saml:config:create 2>"$CREATE_ERR" | tr -d '\r\n[:space:]' || true)
     else
         NEW_ID=$(occ --no-warnings saml:config:create 2>/dev/null | tr -d '\r\n[:space:]' || true)
@@ -141,15 +150,15 @@ if [[ -z "$SAML_CONFIG_ID" ]]; then
     if [[ "$NEW_ID" =~ ^[0-9]+$ ]]; then
         SAML_CONFIG_ID="$NEW_ID"
     else
-        log "warning: saml:config:create returned non-numeric output ($NEW_ID); defaulting to 1"
+        log "FATAL: saml:config:create returned non-numeric output ($NEW_ID)"
         if [[ -n "$CREATE_ERR" && -s "$CREATE_ERR" ]]; then
             while IFS= read -r line; do
                 log "  saml:config:create stderr: $line"
             done < "$CREATE_ERR"
         fi
-        SAML_CONFIG_ID="1"
+        log "  refusing to silently default to slot 1; aborting post-installation"
+        exit 1
     fi
-    [[ -n "$CREATE_ERR" ]] && rm -f "$CREATE_ERR" 2>/dev/null
 fi
 log "using user_saml config id=$SAML_CONFIG_ID"
 
@@ -192,7 +201,16 @@ occ --no-warnings config:system:set upgrade.disable-web --type=boolean --value=t
 
 # Default phone region (used by the ``user_phone_provisioning`` flow,
 # search by phone number, etc.).  Only set if not already configured.
-if ! occ --no-warnings config:system:get default_phone_region 2>/dev/null | grep -q .; then
+# Check whether ``default_phone_region`` is already set.  We want to
+# distinguish three cases: (a) already set → skip; (b) not set →
+# set to default; (c) occ failed → don't silently treat as
+# unset (which would write the default and mask the failure).
+# Capture stdout and exit code separately rather than letting
+# pipefail collapse them.
+PHONE_OUT=$(occ --no-warnings config:system:get default_phone_region 2>/dev/null) || PHONE_OUT="<<OCCFAIL>>"
+if [[ "$PHONE_OUT" == "<<OCCFAIL>>" ]]; then
+    log "warning: occ config:system:get default_phone_region failed; not setting default"
+elif [[ -z "$PHONE_OUT" ]]; then
     occ --no-warnings config:system:set default_phone_region --value="US"
 fi
 
