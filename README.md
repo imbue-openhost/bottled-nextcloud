@@ -97,12 +97,23 @@ support per-app permissions (e.g. read-only).
 
 ### Why `public_paths = ["/"]` is safe
 
-The OpenHost router always sets `X-OpenHost-Is-Owner: true` on owner
-requests. **Client-supplied copies of that header are not stripped on
-public paths.** The auth-sidecar therefore strips `X-OpenHost-Is-Owner`
-AND `X-Openhost-User` from every incoming request and verifies the
-JWT itself. A request that bypasses zone_auth entirely cannot trick
-the sidecar into stamping owner identity.
+`public_paths = ["/"]` tells the **OpenHost router** that no path
+under this app requires `zone_auth` at the router layer. A
+consequence is that the router ALSO does not strip
+client-supplied `X-OpenHost-Is-Owner` headers on those paths
+(the router only overwrites that header for authenticated owners).
+On the surface this looks like a privilege-escalation vector: a
+hostile client could simply send `X-OpenHost-Is-Owner: true` and
+have it propagate untouched through the router.
+
+The auth-sidecar closes that gap: it **unconditionally strips
+`X-Openhost-Is-Owner` AND `X-Openhost-User` from every incoming
+request before any other processing**, including on the bypass
+("public") paths. Owner status is then redetermined inside the
+sidecar by verifying the `zone_auth` JWT against the router's
+JWKS. A request that bypasses `zone_auth` entirely therefore
+cannot trick the sidecar into stamping owner identity, regardless
+of which paths are listed as router-public.
 
 ## First boot / installation
 
@@ -169,6 +180,20 @@ Upgrades happen only by rebuilding the image with a newer base.
 | `REDIS_READY_TIMEOUT` | `30` | Seconds to wait for Redis to respond to PING before declaring startup failed. |
 | `PG_WATCHDOG_INTERVAL` | `15` | Seconds between Postgres `pg_isready` probes. Three consecutive failures terminate the container so OpenHost restarts it. |
 | `AUTH_PROXY_LOG_LEVEL` | `INFO` | Python logging level for the sidecar. Set to `DEBUG` to log per-token JWT verification failures (helpful for diagnosing "I can't log in"). |
+
+The following variables are set by OpenHost itself and consumed
+internally by `start.sh`, the auth-sidecar, and the hooks; they're
+listed here so you don't have to read the source to understand
+what's happening:
+
+| Var | Source | Purpose |
+| --- | --- | --- |
+| `OPENHOST_ROUTER_URL` | OpenHost runtime | The internal URL of the OpenHost router (used by the auth-sidecar to fetch the JWKS). The sidecar refuses to start without this. |
+| `OPENHOST_ZONE_DOMAIN` | OpenHost runtime | The zone's public domain. Used to derive `NEXTCLOUD_DOMAIN`. |
+| `OPENHOST_APP_NAME` | OpenHost runtime | This app's name (`nextcloud`). Used to derive `NEXTCLOUD_DOMAIN`. |
+| `OPENHOST_APP_DATA_DIR` | OpenHost runtime | The persistent-data directory. Defaults to `/var/lib/openhost-nextcloud` if unset (which only happens in standalone testing). |
+| `OPENHOST_APP_TEMP_DATA_DIR` | OpenHost runtime | Per-boot scratch directory; redis.conf is written here. |
+| `OPENHOST_NEXTCLOUD_DOMAIN` | exported by `start.sh` | The resolved public hostname. The before-starting hook reads this to re-stamp `trusted_*` and `overwrite.*`. |
 
 The Nextcloud image's standard env vars (`POSTGRES_*`, `REDIS_*`,
 `NEXTCLOUD_TRUSTED_DOMAINS`, `TRUSTED_PROXIES`, `OVERWRITEHOST`,

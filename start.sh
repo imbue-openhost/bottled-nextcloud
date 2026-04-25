@@ -340,6 +340,13 @@ REDIS_PID=$!
 # / file-locking calls to fail.  Apache's readiness loop uses the
 # same flag-based pattern.
 REDIS_READY_TIMEOUT="${REDIS_READY_TIMEOUT:-30}"
+# Sanity-clamp: 0 (or non-positive) would produce no loop iterations
+# and immediately fail with a misleading "did not respond within 0s"
+# log line.  Force a minimum of 1 second.
+if ! [[ "$REDIS_READY_TIMEOUT" =~ ^[0-9]+$ ]] || (( REDIS_READY_TIMEOUT < 1 )); then
+    log "warning: REDIS_READY_TIMEOUT='$REDIS_READY_TIMEOUT' is not a positive integer; using default 30"
+    REDIS_READY_TIMEOUT=30
+fi
 redis_ready=0
 for _ in $(seq 1 "$REDIS_READY_TIMEOUT"); do
     if redis-cli -s /run/redis/redis.sock ping 2>/dev/null | grep -q PONG; then
@@ -414,6 +421,10 @@ APACHE_PID=$!
 # resolution), we treat that as a fatal startup error rather than
 # silently letting the sidecar serve 502s indefinitely.
 APACHE_READY_TIMEOUT="${APACHE_READY_TIMEOUT:-90}"
+if ! [[ "$APACHE_READY_TIMEOUT" =~ ^[0-9]+$ ]] || (( APACHE_READY_TIMEOUT < 1 )); then
+    log "warning: APACHE_READY_TIMEOUT='$APACHE_READY_TIMEOUT' is not a positive integer; using default 90"
+    APACHE_READY_TIMEOUT=90
+fi
 apache_ready=0
 for _ in $(seq 1 "$APACHE_READY_TIMEOUT"); do
     if APACHE_PORT="${APACHE_PORT:-8081}" python3 -c '
@@ -455,6 +466,10 @@ PROXY_PID=$!
 # false positives during, e.g., a brief WAL replay or a momentary
 # socket-unavailability blip from postgres rotating its log.
 PG_WATCHDOG_INTERVAL="${PG_WATCHDOG_INTERVAL:-15}"
+if ! [[ "$PG_WATCHDOG_INTERVAL" =~ ^[0-9]+$ ]] || (( PG_WATCHDOG_INTERVAL < 1 )); then
+    log "warning: PG_WATCHDOG_INTERVAL='$PG_WATCHDOG_INTERVAL' is not a positive integer; using default 15"
+    PG_WATCHDOG_INTERVAL=15
+fi
 (
     set +e
     fails=0

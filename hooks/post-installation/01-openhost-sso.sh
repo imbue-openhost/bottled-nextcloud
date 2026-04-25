@@ -40,8 +40,6 @@ occ() {
     fi
 }
 
-ADMIN_USER="${NEXTCLOUD_ADMIN_USER:-admin}"
-
 log "installing user_saml app"
 # Probe the current state of user_saml first.  Three cases:
 #   * already enabled  → nothing to do for the install/enable phase
@@ -82,14 +80,14 @@ case "$SAML_STATE" in
 esac
 
 # user_saml stores configs in indexed slots starting at 1.  We need
-# the slot ID for the saml:config:set calls below; in user_saml v8
+# the slot ID for the saml:config:set calls below.  In user_saml v8
 # the discovery API is ``saml:config:get --output=json`` (with NO
 # ``-p`` flag), which returns a JSON dict keyed by provider ID
-# containing every existing config.  ``saml:config:create`` echoes
-# the new provider ID on stdout, which we capture if we have to
-# create one.  Earlier user_saml releases shipped a separate
-# ``saml:config:list`` command which is no longer present in v8;
-# this code therefore stops trying ``list`` and uses ``get``.
+# containing every existing config.  Note the asymmetry: there is
+# NO ``saml:config:list`` command in v8 — only ``get``, ``create``,
+# ``set``, and ``delete``.  ``saml:config:create`` echoes the new
+# provider ID on stdout, which we capture if we have to create one
+# (rather than assuming the new slot is always 1).
 log "configuring user_saml environment-variable mode"
 SAML_CONFIG_ID=""
 # Stage to a tempfile we own and clean up on script exit so a crash

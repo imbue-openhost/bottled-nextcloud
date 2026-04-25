@@ -141,9 +141,10 @@ sys.exit(0 if "user_saml" in (d.get("enabled") or {}) else 1)'; then
     # post-installation hook does, so a deployment with a non-1 slot
     # (e.g. an upgrade-style flow that recreated slots) gets its
     # current slot re-stamped instead of an unrelated slot 1.
-    # ``saml:config:get --output=json`` (no -p) returns a dict keyed
-    # by provider id in user_saml v8.  ``saml:config:list`` does NOT
-    # exist in v8 — earlier code that tried it always silently failed.
+    # ``saml:config:get --output=json`` (no -p flag) returns a dict
+    # keyed by provider ID in user_saml v8.  Note: there is NO
+    # ``saml:config:list`` command in v8 — only ``get``, ``create``,
+    # ``set``, and ``delete``.
     SAML_SLOT=""
     SAML_SLOT_OUT=$(occ --no-warnings saml:config:get --output=json 2>/dev/null || true)
     if [[ -n "$SAML_SLOT_OUT" ]]; then
@@ -182,6 +183,15 @@ elif [[ -z "$APP_LIST" ]]; then
     # "user_saml not enabled" case so an operator investigating a
     # silent SSO failure has a hint to look at the database.
     log "warning: occ app:list returned no output; cannot re-stamp user_saml settings"
+else
+    # APP_LIST is non-empty but the python check exited non-zero —
+    # either the JSON is unparseable (a future Nextcloud version
+    # that prepends warnings to JSON output, or a PHP fatal that
+    # leaked through ``--no-warnings``), or user_saml is genuinely
+    # not enabled.  Log a warning so an operator investigating a
+    # silent SSO failure has a hint that the parse may have failed
+    # — they can re-run the app:list command manually to confirm.
+    log "warning: user_saml not in app:list output, or app:list output unparseable; skipping re-stamp"
 fi
 
 log "before-starting hook complete"

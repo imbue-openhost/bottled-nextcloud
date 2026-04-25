@@ -278,6 +278,7 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
         log.warning("JWKS unavailable; denying owner check: %s", exc)
         return False
     last_error: jwt.PyJWTError | None = None
+    last_non_owner_sub: str | None = None
     for key in keys:
         try:
             claims = jwt.decode(
@@ -298,18 +299,34 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
             continue
         if claims.get("sub") == "owner":
             return True
-    if last_error is not None:
+        # Cryptographically valid token, but the claim isn't
+        # ``owner`` — record the actual subject for diagnostic
+        # logging.  We continue to the next key in case the JWKS
+        # rotation window has multiple valid keys, but the very
+        # first key that decoded successfully will already have
+        # told us the right answer (sub doesn't change with key
+        # rotation), so this loop will terminate quickly in
+        # practice.
+        last_non_owner_sub = claims.get("sub")
+    if last_error is not None or last_non_owner_sub is not None:
         # Log at DEBUG (not INFO/WARNING) because failed JWT
         # verifications are common and noisy: any anonymous request
         # without zone_auth, an expired session, or a third-party
         # request reaches this path.  Operators investigating "why
         # can't I log in?" can crank AUTH_PROXY_LOG_LEVEL=DEBUG to
         # see the per-token failure type (ExpiredSignatureError,
-        # InvalidSignatureError, MissingRequiredClaimError, etc.).
-        log.debug(
-            "JWT verification failed against all %d JWKS key(s): %s: %s",
-            len(keys), type(last_error).__name__, last_error,
-        )
+        # InvalidSignatureError, MissingRequiredClaimError, or
+        # "valid token but sub=foo not owner").
+        if last_non_owner_sub is not None:
+            log.debug(
+                "JWT verified but sub=%r != 'owner'; denying owner check",
+                last_non_owner_sub,
+            )
+        elif last_error is not None:
+            log.debug(
+                "JWT verification failed against all %d JWKS key(s): %s: %s",
+                len(keys), type(last_error).__name__, last_error,
+            )
     return False
 
 
@@ -605,7 +622,18 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         upstream_writer = None
         upstream_reader = None
         try:
-            upstream_writer = upstream_sock.makefile("wb", buffering=0)
+            # ``buffering=-1`` (default) wraps the raw SocketIO in a
+            # BufferedWriter, whose ``.write(b)`` is GUARANTEED to
+            # write every byte (or raise) — unlike SocketIO.write
+            # which can return short on a partial send().  We MUST
+            # have full-write semantics because none of the call
+            # sites in _stream_inner check the return value, and a
+            # short write of an HTTP header line would corrupt the
+            # request mid-flight.  We then ``flush()`` after the
+            # framing block before reading the response so the
+            # upstream sees the complete request before we look
+            # for status bytes.
+            upstream_writer = upstream_sock.makefile("wb")
             upstream_reader = upstream_sock.makefile("rb", buffering=STREAM_CHUNK_BYTES)
             self._stream_inner(
                 upstream_sock,
@@ -737,7 +765,11 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 # request-line + headers.  So we can copy the chunked
                 # stream byte-for-byte to the upstream.  We stop when
                 # we see the terminating ``0\r\n\r\n`` chunk-end.
-                self._copy_chunked(self.rfile, upstream_writer)
+                if not self._copy_chunked(self.rfile, upstream_writer):
+                    log.warning(
+                        "chunked request body forwarded with truncation; "
+                        "upstream may see a malformed request"
+                    )
         except (OSError, TimeoutError) as exc:
             log.info("client/upstream IO error during request body: %s", exc)
             self._safe_send_error(502, "Bad Gateway")
@@ -796,12 +828,13 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             return
         reason = parts[2] if len(parts) > 2 else ""
 
-        # Read response headers until blank line.  We store entries as
-        # mutable two-element lists so RFC 9110 §5.2 obsolete
-        # line-folding (which appends to the previous header) actually
-        # mutates the entry stored in ``resp_headers``, not just a
-        # dangling reference.  Earlier versions of this code used
-        # tuples, which silently lost folded continuations.
+        # Read response headers until blank line.  We store entries
+        # as mutable two-element lists so RFC 9110 §5.2 obsolete
+        # line-folding (which appends to the previous header) can
+        # update the entry in-place via the ``resp_headers[-1]``
+        # reference.  A tuple-based representation would force us
+        # to remove and re-insert the entry, which is more error-
+        # prone.
         resp_headers: list[list[str]] = []
         while True:
             try:
@@ -912,15 +945,31 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
 
         try:
             if resp_te == "chunked":
-                self._copy_chunked(upstream_reader, self.wfile)
+                if not self._copy_chunked(upstream_reader, self.wfile):
+                    # The headers are already on their way out — we
+                    # can't change the response code at this point.
+                    # Logging at WARNING is the best we can do; the
+                    # client may still see a partial chunked stream
+                    # that ends without a zero-chunk.
+                    log.warning(
+                        "chunked response body delivered with truncation"
+                    )
             elif resp_cl is not None:
                 reader = _CappedReader(upstream_reader, resp_cl)
-                _copy_stream(reader, self.wfile)
+                copied = _copy_stream(reader, self.wfile)
+                if copied != resp_cl:
+                    log.warning(
+                        "Content-Length mismatch: declared=%d delivered=%d",
+                        resp_cl, copied,
+                    )
             else:
                 # Connection-close framing: read until upstream EOF.
                 _copy_stream(upstream_reader, self.wfile)
         except OSError as exc:
-            log.debug("IO error streaming response body: %s", exc)
+            # Bumped from DEBUG to INFO so response-side IO errors are
+            # visible at the default log level — was masking upstream
+            # crashes mid-response.
+            log.info("IO error streaming response body: %s", exc)
             return
 
     # Limits used by ``_copy_chunked`` to bound abuse.  An attacker or
@@ -936,12 +985,15 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     # and keeps a single readline from buffering megabytes of input.
     _CHUNKED_LINE_CAP = 8192
 
-    def _copy_chunked(self, src, dst) -> None:
+    def _copy_chunked(self, src, dst) -> bool:
         """Copy a chunked transfer body verbatim from src to dst.
 
-        We don't decode the chunks — the encoding is preserved
-        end-to-end — but we DO need to detect the terminating
-        ``0\\r\\n\\r\\n`` chunk so we know when the body ends.
+        Returns ``True`` if the body terminated cleanly (zero-chunk +
+        terminating blank trailer), ``False`` if we aborted partway
+        through (truncated stream, malformed chunk size, blank-line
+        flood, etc.).  The caller can use the return value to log a
+        warning when the proxy delivers a truncated body, which would
+        otherwise be invisible.
 
         Validation strategy: parse each chunk-size line BEFORE
         forwarding it.  If the line is malformed (not hex, no
@@ -954,7 +1006,8 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             size_line = src.readline(self._CHUNKED_LINE_CAP)
             if not size_line:
                 # Source closed mid-stream.
-                return
+                log.info("chunked stream truncated: EOF before chunk-size line")
+                return False
             # readline() returns up to N bytes; an N-byte return
             # without a terminating newline means the line was
             # truncated and we don't know whether the next bytes are
@@ -965,7 +1018,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     "chunk-size line exceeds %d bytes; aborting stream",
                     self._CHUNKED_LINE_CAP,
                 )
-                return
+                return False
             decoded = size_line.split(b";", 1)[0].strip()
             if not decoded:
                 # Stray blank line.  Cap so an infinite stream of
@@ -978,14 +1031,14 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                         "too many blank chunk-size lines (%d); aborting stream",
                         blank_lines_seen,
                     )
-                    return
+                    return False
                 dst.write(size_line)
                 continue
             try:
                 size = int(decoded, 16)
             except ValueError:
                 log.warning("malformed chunk size: %r", size_line)
-                return
+                return False
             blank_lines_seen = 0
             # Validated: now safe to forward the size line.
             dst.write(size_line)
@@ -997,13 +1050,16 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 while True:
                     trailer = src.readline(self._CHUNKED_LINE_CAP)
                     if not trailer:
-                        return
+                        log.info(
+                            "chunked stream truncated: EOF in trailer block"
+                        )
+                        return False
                     if not trailer.endswith((b"\n",)):
                         log.warning(
                             "trailer line exceeds %d bytes; aborting stream",
                             self._CHUNKED_LINE_CAP,
                         )
-                        return
+                        return False
                     # Forward the line BEFORE counting it so that
                     # the terminating blank line, which is the 65th
                     # line in a max-trailers response, isn't dropped
@@ -1014,21 +1070,27 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     # discarded.
                     dst.write(trailer)
                     if trailer in (b"\r\n", b"\n"):
-                        return
+                        # Clean termination: zero-chunk + blank
+                        # trailer line.
+                        return True
                     trailers_seen += 1
                     if trailers_seen >= self._CHUNKED_MAX_TRAILER_LINES:
                         log.warning(
                             "too many trailer lines (%d); aborting stream",
                             trailers_seen,
                         )
-                        return
+                        return False
                 # unreachable
             # Copy ``size`` bytes plus the trailing CRLF.
             remaining = size
             while remaining > 0:
                 chunk = src.read(min(STREAM_CHUNK_BYTES, remaining))
                 if not chunk:
-                    return
+                    log.info(
+                        "chunked stream truncated: EOF mid-chunk (declared %d bytes, %d remaining)",
+                        size, remaining,
+                    )
+                    return False
                 dst.write(chunk)
                 remaining -= len(chunk)
             # CRLF after each chunk.  ``read(2)`` on a buffered
@@ -1039,7 +1101,10 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             while len(crlf) < 2:
                 more = src.read(2 - len(crlf))
                 if not more:
-                    return
+                    log.info(
+                        "chunked stream truncated: EOF in inter-chunk CRLF"
+                    )
+                    return False
                 crlf += more
             dst.write(crlf)
 
