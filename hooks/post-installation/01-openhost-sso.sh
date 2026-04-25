@@ -81,10 +81,15 @@ case "$SAML_STATE" in
         ;;
 esac
 
-# user_saml stores configs in indexed slots starting at 1.  We always
-# operate on slot 1 since this is a single-IdP deployment.
-# ``saml:config:create`` would create a fresh slot every time it's
-# called; guard by checking for an existing one first.
+# user_saml stores configs in indexed slots starting at 1.  We need
+# the slot ID for the saml:config:set calls below; in user_saml v8
+# the discovery API is ``saml:config:get --output=json`` (with NO
+# ``-p`` flag), which returns a JSON dict keyed by provider ID
+# containing every existing config.  ``saml:config:create`` echoes
+# the new provider ID on stdout, which we capture if we have to
+# create one.  Earlier user_saml releases shipped a separate
+# ``saml:config:list`` command which is no longer present in v8;
+# this code therefore stops trying ``list`` and uses ``get``.
 log "configuring user_saml environment-variable mode"
 SAML_CONFIG_ID=""
 # Stage to a tempfile we own and clean up on script exit so a crash
@@ -93,14 +98,8 @@ SAML_TMP=""
 if SAML_TMP=$(mktemp 2>/dev/null) && [[ -n "$SAML_TMP" ]]; then
     trap 'rm -f "$SAML_TMP" 2>/dev/null || true' EXIT
 fi
-# ``saml:config:list`` is added in user_saml >= 5.x.  Older versions
-# require querying the config table directly.  Try the modern path
-# first; on JSON-parse error or unexpected output we fall through to
-# ``saml:config:create``, which is the safe default.  We log a
-# warning if the JSON failed to parse so an operator can investigate
-# instead of silently winding up with a duplicate config slot.
 if [[ -n "$SAML_TMP" ]] \
-        && occ --no-warnings saml:config:list --output=json > "$SAML_TMP" 2>/dev/null; then
+        && occ --no-warnings saml:config:get --output=json > "$SAML_TMP" 2>/dev/null; then
     PARSE_OUT=$(python3 -c '
 import json, sys
 try:
@@ -108,16 +107,20 @@ try:
 except Exception as exc:
     sys.stderr.write(f"PARSE_ERROR:{exc}\n")
     sys.exit(0)
+# saml:config:get with no -p returns a {provider_id: provider_config}
+# dict.  Pick the lowest numeric ID for stability.
 if isinstance(data, dict) and data:
-    print(next(iter(data.keys())))
-elif isinstance(data, list) and data:
-    # Some versions return [{"id": 1}, ...]
-    item = data[0]
-    if isinstance(item, dict):
-        print(item.get("id", ""))
+    keys = []
+    for k in data.keys():
+        try:
+            keys.append((int(k), k))
+        except (TypeError, ValueError):
+            keys.append((float("inf"), k))
+    keys.sort()
+    print(keys[0][1])
 ' "$SAML_TMP" 2>&1 || true)
     if printf '%s' "$PARSE_OUT" | grep -q "^PARSE_ERROR:"; then
-        log "warning: saml:config:list output unparseable; falling back to fresh config"
+        log "warning: saml:config:get output unparseable; falling back to fresh config"
         log "  $PARSE_OUT"
     else
         SAML_CONFIG_ID=$(printf '%s' "$PARSE_OUT" | tr -d '\n')
@@ -125,8 +128,17 @@ elif isinstance(data, list) and data:
 fi
 if [[ -z "$SAML_CONFIG_ID" ]]; then
     log "creating fresh user_saml config"
-    occ --no-warnings saml:config:create
-    SAML_CONFIG_ID="1"
+    # ``saml:config:create`` echoes the new provider ID as the
+    # entirety of stdout (just a number, no decoration).  Capture it
+    # so we don't blindly assume slot 1 — a re-bootstrap on a data
+    # dir that already had partial slots could allocate slot 4 etc.
+    NEW_ID=$(occ --no-warnings saml:config:create 2>/dev/null | tr -d '\r\n[:space:]' || true)
+    if [[ "$NEW_ID" =~ ^[0-9]+$ ]]; then
+        SAML_CONFIG_ID="$NEW_ID"
+    else
+        log "warning: saml:config:create returned non-numeric output ($NEW_ID); defaulting to 1"
+        SAML_CONFIG_ID="1"
+    fi
 fi
 log "using user_saml config id=$SAML_CONFIG_ID"
 

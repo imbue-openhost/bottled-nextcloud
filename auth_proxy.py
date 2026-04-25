@@ -97,11 +97,16 @@ HOP_BY_HOP_HEADERS = frozenset(
         "Trailer",
         "Transfer-Encoding",
         "Upgrade",
-        # Host is rewritten by http.client based on the target host.
+        # Host is rewritten by us in the request-line emission code
+        # (see ``_stream_inner``) based on the upstream target.
         "Host",
         # Content-Length / Transfer-Encoding determine framing — we
-        # forward the original framing exactly via the raw stream;
-        # http.client must not insert its own.
+        # strip the original here and re-stamp the right framing
+        # header in ``_stream_inner`` based on the body mode we
+        # actually transmit.  Forwarding both verbatim (which the
+        # client's headers might be inconsistent with after we
+        # buffered or re-framed the body) would corrupt parse on
+        # the upstream side.
         "Content-Length",
     )
 )
@@ -591,10 +596,17 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         upstream's headers and copied to the client verbatim.
         """
         upstream_sock.settimeout(STREAM_TIMEOUT_SECONDS)
-        upstream_writer = upstream_sock.makefile("wb", buffering=0)
-        upstream_reader = upstream_sock.makefile("rb", buffering=STREAM_CHUNK_BYTES)
-
+        # Initialise to None so the finally block can clean up
+        # whichever file objects were successfully created — without
+        # the explicit ``None`` defaults a failure in the second
+        # ``makefile`` call (e.g., FD-limit hit) would raise
+        # NameError when the finally tried to close the unbound
+        # ``upstream_reader`` and skip closing ``upstream_writer``.
+        upstream_writer = None
+        upstream_reader = None
         try:
+            upstream_writer = upstream_sock.makefile("wb", buffering=0)
+            upstream_reader = upstream_sock.makefile("rb", buffering=STREAM_CHUNK_BYTES)
             self._stream_inner(
                 upstream_sock,
                 upstream_writer,
@@ -609,6 +621,8 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             # duplicates.  Close both file objects here and let the
             # caller's finally close the underlying socket.
             for f in (upstream_writer, upstream_reader):
+                if f is None:
+                    continue
                 try:
                     f.close()
                 except OSError:
@@ -824,7 +838,12 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             name, _, value = decoded.partition(":")
             resp_headers.append([name.strip(), value.strip()])
 
-        # Detect response framing.
+        # Detect response framing.  We're defensive about
+        # negative or non-integer Content-Length values: a malicious
+        # or buggy upstream could otherwise corrupt our framing
+        # (negative ``_CappedReader`` has remaining=0 and reads
+        # nothing, while we'd echo the negative number to the
+        # client as an invalid header).
         resp_te = ""
         resp_cl: int | None = None
         for k, v in resp_headers:
@@ -833,9 +852,18 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 resp_te = v.lower().strip()
             elif kl == "content-length":
                 try:
-                    resp_cl = int(v.strip())
+                    parsed_cl = int(v.strip())
                 except ValueError:
                     resp_cl = None
+                    continue
+                if parsed_cl < 0:
+                    log.warning(
+                        "upstream sent negative Content-Length %d; ignoring",
+                        parsed_cl,
+                    )
+                    resp_cl = None
+                    continue
+                resp_cl = parsed_cl
 
         # ---- write status + headers to client ----
         try:
@@ -976,15 +1004,23 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                             self._CHUNKED_LINE_CAP,
                         )
                         return
+                    # Forward the line BEFORE counting it so that
+                    # the terminating blank line, which is the 65th
+                    # line in a max-trailers response, isn't dropped
+                    # by the cap.  A correctly-formed response with
+                    # exactly _CHUNKED_MAX_TRAILER_LINES (64) actual
+                    # trailer headers + a blank terminator would
+                    # otherwise have its terminator silently
+                    # discarded.
+                    dst.write(trailer)
+                    if trailer in (b"\r\n", b"\n"):
+                        return
                     trailers_seen += 1
-                    if trailers_seen > self._CHUNKED_MAX_TRAILER_LINES:
+                    if trailers_seen >= self._CHUNKED_MAX_TRAILER_LINES:
                         log.warning(
                             "too many trailer lines (%d); aborting stream",
                             trailers_seen,
                         )
-                        return
-                    dst.write(trailer)
-                    if trailer in (b"\r\n", b"\n"):
                         return
                 # unreachable
             # Copy ``size`` bytes plus the trailing CRLF.

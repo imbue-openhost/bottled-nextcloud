@@ -1,12 +1,14 @@
 #!/bin/bash
 # Entrypoint for openhost-nextcloud.
 #
-# We need /bin/bash (not /bin/sh) because we use ``wait -n`` to supervise
-# multiple background children — Apache (via the upstream Nextcloud
-# entrypoint), the Python auth-sidecar, PostgreSQL (run via ``pg_ctl
-# start`` so it forks into the background), and Redis (foregrounded as
-# a child).  ``wait -n`` is a bashism not available in the Debian
-# ``dash``-based /bin/sh.
+# We need /bin/bash (not /bin/sh) because we use ``wait -n`` to
+# supervise multiple background children: Apache (via the upstream
+# Nextcloud entrypoint), the Python auth-sidecar, Redis, and a small
+# pg_isready watchdog.  PostgreSQL itself is started via ``pg_ctl
+# start`` so it forks into the background; it is NOT a direct child
+# of this shell — the watchdog detects its death by polling and exits
+# non-zero, which trips the ``wait -n`` cleanup path.  ``wait -n`` is
+# a bashism not available in the Debian ``dash``-based /bin/sh.
 #
 # What this script does on every boot:
 #   1. Resolve the public domain (<APP>.<ZONE>) and a few env vars the
@@ -21,11 +23,15 @@
 #      chmod 644 so the operator can read via the file-browser).
 #   5. Generate the Nextcloud admin password (persisted to
 #      ``$DATA_DIR/admin_password.txt`` chmod 644 same reason).
-#   6. ``exec`` the upstream ``/entrypoint.sh apache2-foreground`` as a
-#      background child — that runs install/upgrade hooks then Apache.
-#   7. Start the auth_proxy.py sidecar on :8080.
-#   8. ``wait -n`` on the four children; if any dies, tear the rest
-#      down and exit so OpenHost restarts the container.
+#   6. Run the upstream ``/entrypoint.sh apache2-foreground`` as a
+#      backgrounded child — that runs install/upgrade hooks then
+#      Apache.  (It's NOT ``exec``'d — the trailing ``&`` makes it a
+#      child so ``wait -n`` can supervise it.)
+#   7. Start the auth_proxy.py sidecar on :8080 and a pg_isready
+#      watchdog as further backgrounded children.
+#   8. ``wait -n`` on Apache, the proxy, Redis, and the pg watchdog;
+#      if any dies, tear the rest down (via the EXIT trap) and exit
+#      so OpenHost restarts the container.
 #
 # All persistent secrets live under $OPENHOST_APP_DATA_DIR.  Under
 # rootless podman the container's ``root`` is mapped to a random
@@ -114,9 +120,22 @@ load_or_generate() {
         rm -f "$partial" 2>/dev/null || true
         exit 1
     fi
-    # 644 not 600: under rootless podman the file-browser app's UID
-    # differs from this container's UID.  The data dir is already
-    # scoped to this app under OpenHost's data model.
+    # 644 not 600: under rootless podman, the file-browser app
+    # (which the operator uses to retrieve these passwords via the
+    # OpenHost data API) runs in a different container with a
+    # different UID and ACL set.  600 would block the legitimate
+    # operator-readback path.
+    #
+    # Tradeoff: any process inside THIS container running as
+    # ``www-data`` (Apache+PHP), ``redis``, or otherwise non-root
+    # can also read these files.  We mitigate this for the postgres
+    # password via pg_hba.conf — see the ``local all all reject``
+    # entry there: PHP can read the password file but its postgres
+    # connection must still go through TCP+md5 with the same
+    # password it already needs to know to do its job.  The
+    # admin password is an emergency credential whose disclosure
+    # to PHP is horizontal (PHP already has equivalent privilege
+    # via SSO when properly authenticated).
     chmod 644 "$file"
     printf '%s' "$fresh"
 }
@@ -148,15 +167,29 @@ if [[ ! -f "$PG_DATA/PG_VERSION" ]]; then
     # role we'll create later uses md5 auth via pg_hba below.
     su postgres -c "$PG_BIN/initdb -D '$PG_DATA' --auth-local=trust --auth-host=md5 --encoding=UTF8 --locale=C.UTF-8"
 
-    # Listen only on the unix socket — Nextcloud connects via
-    # 127.0.0.1 over TCP because the upstream image's php-pgsql can't
-    # easily be persuaded to use the socket; we'll add a listen_addresses
-    # below.  pg_hba: trust local socket access (postgres role only),
-    # md5 for TCP from 127.0.0.1.
+    # Listen on 127.0.0.1 over TCP because the upstream Nextcloud
+    # image's php-pgsql can't easily be persuaded to use the unix
+    # socket from PHP (it can technically, but the env-var driven
+    # upstream entrypoint passes ``host=`` rather than the socket
+    # path).  pg_hba below ensures:
+    #   - The unix socket grants password-less access ONLY to the
+    #     ``postgres`` superuser (used by start.sh + provision_db
+    #     for bootstrap).  Other OS users in the container (notably
+    #     ``www-data`` running PHP, and ``redis``) get nothing on
+    #     the socket — they MUST go through TCP+md5, which requires
+    #     the password we generated.
+    #   - TCP from 127.0.0.1 uses md5 for everyone (including the
+    #     ``nextcloud`` role, the only one PHP knows the password
+    #     for).
+    #   - All other connectivity is rejected.
     cat > "$PG_DATA/pg_hba.conf" <<'EOF'
-local   all all                trust
-host    all all 127.0.0.1/32   md5
-host    all all ::1/128        md5
+# OpenHost-managed: postgres superuser only on the unix socket.
+local   all postgres                  trust
+local   all all                       reject
+host    all all      127.0.0.1/32     md5
+host    all all      ::1/128          md5
+host    all all      0.0.0.0/0        reject
+host    all all      ::/0             reject
 EOF
 
     # Tune for a small container.

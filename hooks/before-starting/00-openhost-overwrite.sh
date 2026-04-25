@@ -20,6 +20,13 @@
 # restart loop.  A failure to re-stamp these settings is recoverable
 # (the previous values stay in place) so we log+continue rather than
 # abort.
+#
+# We DO enable ``-u`` (unset variable use) so a typo in a variable
+# name surfaces as an error instead of silently expanding to empty,
+# and ``-o pipefail`` so the exit status of a pipeline reflects the
+# leftmost failed command (helpful for the ``occ ... | python3 ...``
+# chains below).  The unconditional EXIT trap below remaps any
+# non-zero exit to 0 so neither flag actually aborts the boot.
 set -uo pipefail
 
 log() { printf '[before-starting] %s\n' "$*" >&2; }
@@ -130,16 +137,15 @@ try:
 except Exception:
     sys.exit(2)
 sys.exit(0 if "user_saml" in (d.get("enabled") or {}) else 1)'; then
-    # Discover which user_saml config slot to update.  The
-    # post-installation hook prefers the first existing slot if any
-    # were present at install time (which can be non-1) and only
-    # falls back to creating a slot 1 when none exist.  Re-discover
-    # the same slot here so a deployment with an existing slot 2 (or
-    # higher) doesn't get its config 1 silently re-stamped.  If
-    # discovery fails we fall back to slot 1 — same behavior as
-    # before, but with a logged warning.
+    # Discover the active user_saml config slot the same way the
+    # post-installation hook does, so a deployment with a non-1 slot
+    # (e.g. an upgrade-style flow that recreated slots) gets its
+    # current slot re-stamped instead of an unrelated slot 1.
+    # ``saml:config:get --output=json`` (no -p) returns a dict keyed
+    # by provider id in user_saml v8.  ``saml:config:list`` does NOT
+    # exist in v8 — earlier code that tried it always silently failed.
     SAML_SLOT=""
-    SAML_SLOT_OUT=$(occ --no-warnings saml:config:list --output=json 2>/dev/null || true)
+    SAML_SLOT_OUT=$(occ --no-warnings saml:config:get --output=json 2>/dev/null || true)
     if [[ -n "$SAML_SLOT_OUT" ]]; then
         SAML_SLOT=$(printf '%s' "$SAML_SLOT_OUT" | python3 -c '
 import json, sys
@@ -148,11 +154,14 @@ try:
 except Exception:
     sys.exit(0)
 if isinstance(data, dict) and data:
-    print(next(iter(data.keys())))
-elif isinstance(data, list) and data:
-    item = data[0]
-    if isinstance(item, dict):
-        print(item.get("id", ""))
+    keys = []
+    for k in data.keys():
+        try:
+            keys.append((int(k), k))
+        except (TypeError, ValueError):
+            keys.append((float("inf"), k))
+    keys.sort()
+    print(keys[0][1])
 ' 2>/dev/null | tr -d '\n' || true)
     fi
     if [[ -z "$SAML_SLOT" ]]; then

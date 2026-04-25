@@ -20,9 +20,17 @@ app, with single sign-on via the OpenHost zone's `zone_auth` cookie.
     (`/var/www/html/data`, `/var/www/html/config`, custom apps, etc.)
     are bind-mounted under the upstream image's own paths, which are
     inside the container filesystem
-  - `.postgres_password` — chmod 644, regenerated only if absent
+  - `.postgres_password` — chmod 644.  Regenerated only when the
+    file is missing OR present-but-empty/corrupt (truncated to zero
+    bytes, all-whitespace, etc.).  An operator who hand-edits this
+    file should make sure the new value is on a single non-blank
+    line so the boot-time loader doesn't treat it as corrupt and
+    silently overwrite it.  If you change the password by hand, the
+    boot following will also issue an ``ALTER ROLE`` to keep
+    Postgres' role password in sync.
   - `admin_password.txt` — chmod 644, the bootstrap admin
-    Nextcloud account's password
+    Nextcloud account's password.  Same regeneration rules as
+    `.postgres_password`.
 - `[runtime.container]` requests 1.5 GiB / 1.5 cores. Bump
   `memory_mb` in `openhost.toml` if you run heavy workloads (Talk,
   OnlyOffice, large preview backlogs).
