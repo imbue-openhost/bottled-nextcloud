@@ -84,6 +84,13 @@ STREAM_CHUNK_BYTES = 64 * 1024
 # the connection is torn down.  Generous because Nextcloud uploads can
 # legitimately take many minutes for large files on slow networks.
 STREAM_TIMEOUT_SECONDS = 30 * 60
+# Maximum size we'll readline() for an upstream response status line
+# or response header.  Sits at module scope alongside the other
+# protocol-shape constants.  64 KiB is well above any realistic
+# legitimate header (a JWT in a Set-Cookie or a Link rel=preload
+# can run a few KiB) while keeping a single readline from buffering
+# unbounded bytes if the upstream sends a runaway line.
+HEADER_LINE_CAP = 64 * 1024
 # Hop-by-hop headers (RFC 9110 §7.6.1) plus a few entries we rewrite
 # ourselves at the proxy seam.  We forward neither direction.
 HOP_BY_HOP_HEADERS = frozenset(
@@ -488,10 +495,15 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     def _proxy(self) -> None:
         # Apply a generous read timeout to the client socket — large
         # uploads on slow networks legitimately take many minutes.
+        # If the call fails (very unlikely; the socket should be in
+        # a healthy state at this point), continue without a timeout
+        # but log so an operator investigating "request stalls
+        # forever" has a hint.  log.debug because this is rare and
+        # noisy in production logs at higher levels.
         try:
             self.connection.settimeout(STREAM_TIMEOUT_SECONDS)
-        except OSError:
-            pass
+        except OSError as exc:
+            log.debug("settimeout on client socket failed: %s", exc)
 
         # Ensure the JWKS cache is available before we make policy
         # decisions.  This is set in main() before the server starts;
@@ -770,6 +782,20 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                         "chunked request body forwarded with truncation; "
                         "upstream may see a malformed request"
                     )
+                    # Half-close the write side so Apache sees EOF
+                    # promptly and replies with 400 (matching the
+                    # behaviour of the fixed-length truncation path
+                    # above).  Without this, Apache would wait for
+                    # more chunk data and pin the handler thread for
+                    # the full STREAM_TIMEOUT_SECONDS.
+                    try:
+                        upstream_writer.flush()
+                    except OSError as exc:
+                        log.debug("upstream flush before half-close failed: %s", exc)
+                    try:
+                        upstream_sock.shutdown(socket.SHUT_WR)
+                    except OSError as exc:
+                        log.debug("upstream half-close failed: %s", exc)
         except (OSError, TimeoutError) as exc:
             log.info("client/upstream IO error during request body: %s", exc)
             self._safe_send_error(502, "Bad Gateway")
@@ -784,92 +810,125 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             return
 
         # ---- read response status + headers ----
-        # 64 KiB is generous: an HTTP-spec status-line tops out around
-        # 1 KiB even for the longest reason phrase, so anything bigger
-        # is likely a client/upstream confusion that we should bail on.
-        # Individual response headers (e.g. a long Set-Cookie carrying
-        # a JWT, or a giant Link rel=preload) can legitimately be a
-        # few KiB; the same 64 KiB cap covers them all.
-        HEADER_LINE_CAP = 64 * 1024
-        try:
-            status_line = upstream_reader.readline(HEADER_LINE_CAP)
-        except OSError as exc:
-            log.warning("upstream read status failed: %s", exc)
-            self._safe_send_error(502, "Bad Gateway")
-            return
-        if not status_line:
-            log.warning("upstream closed before sending status line")
-            self._safe_send_error(502, "Bad Gateway")
-            return
-        # ``readline(N)`` returns up to N bytes; if it didn't end in a
-        # newline, the line was truncated and the stream is in an
-        # ambiguous state (subsequent ``readline`` would interpret the
-        # remainder of the over-long line as a new entry).  Bail.
-        if not status_line.endswith((b"\n",)):
-            log.warning("upstream status line exceeds %d bytes", HEADER_LINE_CAP)
-            self._safe_send_error(502, "upstream status line too long")
-            return
-
-        try:
-            parts = status_line.decode("latin-1").rstrip("\r\n").split(" ", 2)
-        except UnicodeDecodeError:
-            log.warning("upstream status line not latin-1")
-            self._safe_send_error(502, "Bad Gateway")
-            return
-        if len(parts) < 2 or not parts[0].startswith("HTTP/"):
-            log.warning("malformed upstream status line: %r", status_line)
-            self._safe_send_error(502, "Bad Gateway")
-            return
-        try:
-            status_code = int(parts[1])
-        except ValueError:
-            log.warning("non-numeric status code: %r", parts[1])
-            self._safe_send_error(502, "Bad Gateway")
-            return
-        reason = parts[2] if len(parts) > 2 else ""
-
-        # Read response headers until blank line.  We store entries
-        # as mutable two-element lists so RFC 9110 §5.2 obsolete
-        # line-folding (which appends to the previous header) can
-        # update the entry in-place via the ``resp_headers[-1]``
-        # reference.  A tuple-based representation would force us
-        # to remove and re-insert the entry, which is more error-
-        # prone.
+        #
+        # We loop over status lines so that an upstream that emits an
+        # interim 1xx response (most notably ``HTTP/1.1 100 Continue``
+        # in answer to ``Expect: 100-continue`` from the client) is
+        # silently consumed and discarded — RFC 9110 §15.2 says
+        # interim responses are followed by zero-or-more headers and
+        # then a final response, and that intermediaries should not
+        # forward 100 to a client that didn't send Expect.  The
+        # OpenHost router can't be assumed to add Expect support, so
+        # the safe behaviour is to absorb interim responses and only
+        # forward the final status to the client.
+        #
+        # ``HEADER_LINE_CAP`` is defined at module scope.
+        status_code: int = 0
+        reason: str = ""
         resp_headers: list[list[str]] = []
+        # Hard cap on the number of interim responses we accept before
+        # giving up — a runaway upstream emitting nothing but 100s
+        # would otherwise wedge the proxy here.  Eight is far more
+        # than any sensible upstream produces.
+        MAX_INTERIM = 8
+        interim_seen = 0
         while True:
             try:
-                line = upstream_reader.readline(HEADER_LINE_CAP)
+                status_line = upstream_reader.readline(HEADER_LINE_CAP)
             except OSError as exc:
-                log.warning("upstream read header failed: %s", exc)
+                log.warning("upstream read status failed: %s", exc)
                 self._safe_send_error(502, "Bad Gateway")
                 return
-            if not line or line in (b"\r\n", b"\n"):
-                break
-            if not line.endswith((b"\n",)):
+            if not status_line:
+                log.warning("upstream closed before sending status line")
+                self._safe_send_error(502, "Bad Gateway")
+                return
+            if not status_line.endswith((b"\n",)):
                 log.warning(
-                    "upstream header line exceeds %d bytes",
-                    HEADER_LINE_CAP,
+                    "upstream status line exceeds %d bytes", HEADER_LINE_CAP
                 )
-                self._safe_send_error(502, "upstream header too long")
+                self._safe_send_error(502, "upstream status line too long")
+                return
+
+            try:
+                parts = status_line.decode("latin-1").rstrip("\r\n").split(" ", 2)
+            except UnicodeDecodeError:
+                log.warning("upstream status line not latin-1")
+                self._safe_send_error(502, "Bad Gateway")
+                return
+            if len(parts) < 2 or not parts[0].startswith("HTTP/"):
+                log.warning("malformed upstream status line: %r", status_line)
+                self._safe_send_error(502, "Bad Gateway")
                 return
             try:
-                decoded = line.decode("latin-1").rstrip("\r\n")
-            except UnicodeDecodeError:
-                log.warning("upstream header not latin-1")
+                status_code = int(parts[1])
+            except ValueError:
+                log.warning("non-numeric status code: %r", parts[1])
                 self._safe_send_error(502, "Bad Gateway")
                 return
-            # Continuation lines start with whitespace; append to the
-            # previous header's value (mutating the entry in
-            # ``resp_headers`` because we hold a reference).
-            if line[:1] in (b" ", b"\t") and resp_headers:
-                resp_headers[-1][1] = resp_headers[-1][1] + " " + decoded.strip()
+            reason = parts[2] if len(parts) > 2 else ""
+
+            # Read response headers until blank line.  We store
+            # entries as mutable two-element lists so RFC 9110 §5.2
+            # obsolete line-folding can update the entry in-place via
+            # the ``resp_headers[-1]`` reference.
+            resp_headers = []
+            while True:
+                try:
+                    line = upstream_reader.readline(HEADER_LINE_CAP)
+                except OSError as exc:
+                    log.warning("upstream read header failed: %s", exc)
+                    self._safe_send_error(502, "Bad Gateway")
+                    return
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+                if not line.endswith((b"\n",)):
+                    log.warning(
+                        "upstream header line exceeds %d bytes",
+                        HEADER_LINE_CAP,
+                    )
+                    self._safe_send_error(502, "upstream header too long")
+                    return
+                try:
+                    decoded = line.decode("latin-1").rstrip("\r\n")
+                except UnicodeDecodeError:
+                    log.warning("upstream header not latin-1")
+                    self._safe_send_error(502, "Bad Gateway")
+                    return
+                # Continuation lines start with whitespace; append to
+                # the previous header's value (mutating the entry in
+                # ``resp_headers`` because we hold a reference).
+                if line[:1] in (b" ", b"\t") and resp_headers:
+                    resp_headers[-1][1] = (
+                        resp_headers[-1][1] + " " + decoded.strip()
+                    )
+                    continue
+                if ":" not in decoded:
+                    # Skip malformed lines silently.
+                    continue
+                name, _, value = decoded.partition(":")
+                resp_headers.append([name.strip(), value.strip()])
+
+            # 1xx status codes are interim per RFC 9110 §15.2.  Loop
+            # back to read the next status line.  Anything else
+            # (including the 101 Switching Protocols which SHOULD be
+            # handled differently — we treat it as final and forward
+            # to the client; the OpenHost router doesn't support
+            # WebSocket upgrades through this proxy anyway).
+            if 100 <= status_code < 200 and status_code != 101:
+                interim_seen += 1
+                if interim_seen > MAX_INTERIM:
+                    log.warning(
+                        "upstream sent more than %d interim responses; aborting",
+                        MAX_INTERIM,
+                    )
+                    self._safe_send_error(502, "too many interim responses")
+                    return
+                log.debug(
+                    "skipping interim response %d %s", status_code, reason
+                )
                 continue
-            if ":" not in decoded:
-                # Skip malformed lines silently — http.client does the
-                # same.
-                continue
-            name, _, value = decoded.partition(":")
-            resp_headers.append([name.strip(), value.strip()])
+            break
 
         # Detect response framing.  We're defensive about
         # negative or non-integer Content-Length values: a malicious
@@ -966,9 +1025,10 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 # Connection-close framing: read until upstream EOF.
                 _copy_stream(upstream_reader, self.wfile)
         except OSError as exc:
-            # Bumped from DEBUG to INFO so response-side IO errors are
-            # visible at the default log level — was masking upstream
-            # crashes mid-response.
+            # Log at INFO so a mid-response upstream crash or client
+            # disconnect is visible at the default log level.  The
+            # response headers are already on the wire and we can no
+            # longer change the status code.
             log.info("IO error streaming response body: %s", exc)
             return
 
@@ -1074,7 +1134,13 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                         # trailer line.
                         return True
                     trailers_seen += 1
-                    if trailers_seen >= self._CHUNKED_MAX_TRAILER_LINES:
+                    # Use ``>`` not ``>=`` so the cap allows exactly
+                    # ``_CHUNKED_MAX_TRAILER_LINES`` non-blank
+                    # trailer headers + the terminating blank line.
+                    # ``>=`` would make trailers_seen=64 abort right
+                    # before reading the (legitimate) blank line on
+                    # the next iteration.
+                    if trailers_seen > self._CHUNKED_MAX_TRAILER_LINES:
                         log.warning(
                             "too many trailer lines (%d); aborting stream",
                             trailers_seen,

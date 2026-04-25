@@ -73,13 +73,38 @@ log "re-stamping overwrite.* and trusted_* for $DOMAIN"
 # instead of silently leaving stale config in place.  We don't abort
 # on a single failure (``set -e`` is intentionally off) — partial
 # re-stamp is preferable to a crashed Apache.
+#
+# We capture stderr to a tempfile so the log line includes the
+# actual diagnostic from occ (DB connection error, unknown config
+# key, PHP fatal, …) rather than a generic "X failed" message.
+# If mktemp itself fails we fall back to discarding stderr — the
+# warning still fires, just without the diagnostic body.
 occ_or_warn() {
     local desc="$1"
     shift
-    if ! occ --no-warnings "$@" >/dev/null 2>&1; then
+    local err
+    err=$(mktemp 2>/dev/null) || err=""
+    local rc
+    if [[ -n "$err" ]]; then
+        occ --no-warnings "$@" >/dev/null 2>"$err"
+        rc=$?
+    else
+        occ --no-warnings "$@" >/dev/null 2>&1
+        rc=$?
+    fi
+    if [[ "$rc" -ne 0 ]]; then
         log "warning: $desc failed (continuing with previous value)"
+        if [[ -n "$err" && -s "$err" ]]; then
+            # Surface the error output, prefixed so it's visually
+            # nested under the warning line.
+            while IFS= read -r line; do
+                log "  occ: $line"
+            done < "$err"
+        fi
+        rm -f "$err" 2>/dev/null || true
         return 1
     fi
+    rm -f "$err" 2>/dev/null || true
     return 0
 }
 

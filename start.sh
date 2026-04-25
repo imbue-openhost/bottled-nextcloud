@@ -215,12 +215,39 @@ chown -R postgres:postgres "$PG_DATA" 2>/dev/null || true
 rm -f "$PG_DATA/postmaster.pid"
 
 PG_LOG="$PG_DATA/postgresql.log"
+
+# Initialise the supervisor PIDs and the cleanup machinery BEFORE
+# starting Postgres.  Postgres is started via ``pg_ctl`` so it
+# forks into the background and is not a direct child of this
+# shell — without an EXIT-trap-driven cleanup, an exit before the
+# main supervisor section (e.g. provision_db failure) would leave
+# Postgres running as an orphan tied to the now-dead container.
+REDIS_PID=""
+APACHE_PID=""
+PROXY_PID=""
+PG_WATCHDOG_PID=""
+TERMINATING=0
+cleanup() {
+    if [[ "$TERMINATING" == "1" ]]; then
+        return
+    fi
+    TERMINATING=1
+    log "tearing down"
+    kill -TERM ${APACHE_PID:-} ${PROXY_PID:-} ${REDIS_PID:-} \
+              ${PG_WATCHDOG_PID:-} 2>/dev/null || true
+    # Postgres is not a direct child; stop it via pg_ctl.
+    su postgres -c "$PG_BIN/pg_ctl stop -D '$PG_DATA' -m fast" 2>/dev/null || true
+    wait 2>/dev/null || true
+}
+trap cleanup TERM INT EXIT
+
 log "starting postgres"
 # We use ``pg_ctl start`` (not ``postgres -D``) so postgres forks into
 # the background and we can wait for it to be ready before continuing
 # (the ``-w`` flag).  The tradeoff: postgres' PID is not a direct
 # child of our shell, so ``wait -n`` won't see it die.  We compensate
-# with the pg_isready watchdog later in the supervisor section.
+# with the pg_isready watchdog later in the supervisor section, and
+# the EXIT trap above guarantees we tear it down on any exit path.
 su postgres -c "$PG_BIN/pg_ctl start -D '$PG_DATA' -l '$PG_LOG' -w -t 60 -o '-k /run/postgresql'"
 
 # ---------------------------------------------------------------------
@@ -298,37 +325,9 @@ EOF
 chmod 644 "$REDIS_CONF"
 chown -R redis:redis "$REDIS_DIR" /run/redis 2>/dev/null || true
 
-REDIS_PID=""
-APACHE_PID=""
-PROXY_PID=""
-PG_WATCHDOG_PID=""
-
-# Trap BEFORE any backgrounding so a SIGTERM that arrives during the
-# small race window between ``&`` and the trap line doesn't use bash's
-# default handler and orphan our children.
-#
-# The trap is registered for TERM/INT (signal-driven shutdown), and
-# also for EXIT so that any ``exit 1`` path (Apache failed to bind,
-# Redis didn't become ready, etc.) tears Postgres down too instead of
-# leaking it as an orphan — Postgres is started via ``pg_ctl`` so it's
-# not a direct child of this shell.
-TERMINATING=0
-cleanup() {
-    # Make cleanup idempotent: a SIGTERM may fire and also trip the
-    # EXIT trap as the shell shuts down.  Without a guard we'd send
-    # two rounds of SIGTERMs and stop postgres twice.
-    if [[ "$TERMINATING" == "1" ]]; then
-        return
-    fi
-    TERMINATING=1
-    log "tearing down"
-    kill -TERM ${APACHE_PID:-} ${PROXY_PID:-} ${REDIS_PID:-} \
-              ${PG_WATCHDOG_PID:-} 2>/dev/null || true
-    # Also stop postgres explicitly (it's not a direct child).
-    su postgres -c "$PG_BIN/pg_ctl stop -D '$PG_DATA' -m fast" 2>/dev/null || true
-    wait 2>/dev/null || true
-}
-trap cleanup TERM INT EXIT
+# Cleanup machinery + trap were registered earlier, before the
+# pg_ctl call.  See the block above the postgres startup for
+# details.
 
 log "starting redis"
 redis-server "$REDIS_CONF" &
