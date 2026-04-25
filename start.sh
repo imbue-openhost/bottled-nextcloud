@@ -184,10 +184,10 @@ rm -f "$PG_DATA/postmaster.pid"
 PG_LOG="$PG_DATA/postgresql.log"
 log "starting postgres"
 # We use ``pg_ctl start`` (not ``postgres -D``) so postgres forks into
-# the background and we can supervise the parent shell instead.  The
-# tradeoff: postgres' PID is not directly a child of our shell, so
-# ``wait -n`` won't see it die.  We add a periodic liveness check via
-# the supervisor below.
+# the background and we can wait for it to be ready before continuing
+# (the ``-w`` flag).  The tradeoff: postgres' PID is not a direct
+# child of our shell, so ``wait -n`` won't see it die.  We compensate
+# with the pg_isready watchdog later in the supervisor section.
 su postgres -c "$PG_BIN/pg_ctl start -D '$PG_DATA' -l '$PG_LOG' -w -t 60 -o '-k /run/postgresql'"
 
 # ---------------------------------------------------------------------
@@ -259,13 +259,15 @@ chown -R redis:redis "$REDIS_DIR" /run/redis 2>/dev/null || true
 REDIS_PID=""
 APACHE_PID=""
 PROXY_PID=""
+PG_WATCHDOG_PID=""
 
 # Trap BEFORE any backgrounding so a SIGTERM that arrives during the
 # small race window between ``&`` and the trap line doesn't use bash's
 # default handler and orphan our children.
 cleanup() {
     log "received signal; tearing down"
-    kill -TERM ${APACHE_PID:-} ${PROXY_PID:-} ${REDIS_PID:-} 2>/dev/null || true
+    kill -TERM ${APACHE_PID:-} ${PROXY_PID:-} ${REDIS_PID:-} \
+              ${PG_WATCHDOG_PID:-} 2>/dev/null || true
     # Also stop postgres explicitly (it's not a direct child).
     su postgres -c "$PG_BIN/pg_ctl stop -D '$PG_DATA' -m fast" 2>/dev/null || true
     wait 2>/dev/null || true
@@ -358,18 +360,48 @@ log "starting auth-proxy on :${AUTH_PROXY_LISTEN_PORT:-8080}"
 python3 /usr/local/bin/auth_proxy.py &
 PROXY_PID=$!
 
+# Postgres was started via ``pg_ctl start`` so it's NOT a direct child
+# of this shell — ``wait -n`` cannot see it die.  Without intervention,
+# a postgres crash would leave Apache running and serving 500s
+# indefinitely.  Run a small watchdog as a real child of this shell:
+# every ``PG_WATCHDOG_INTERVAL`` seconds it pings postgres via
+# ``pg_isready``; on three consecutive failures it exits non-zero,
+# which trips the ``wait -n`` cleanup path and tears the container
+# down so OpenHost restarts it.  Three strikes (not one) avoids
+# false positives during, e.g., a brief WAL replay or a momentary
+# socket-unavailability blip from postgres rotating its log.
+PG_WATCHDOG_INTERVAL="${PG_WATCHDOG_INTERVAL:-15}"
+(
+    set +e
+    fails=0
+    while :; do
+        sleep "$PG_WATCHDOG_INTERVAL"
+        if "$PG_BIN/pg_isready" -h /run/postgresql -q; then
+            fails=0
+        else
+            fails=$((fails + 1))
+            log "postgres watchdog: pg_isready failed ($fails consecutive)"
+            if [[ $fails -ge 3 ]]; then
+                log "postgres watchdog: 3 consecutive failures, exiting"
+                exit 1
+            fi
+        fi
+    done
+) &
+PG_WATCHDOG_PID=$!
+
 # ---------------------------------------------------------------------
 # Supervise the children.  ``wait -n`` returns when any one exits.
 # ``set -e`` is suppressed around it so a non-zero child exit doesn't
 # bypass our cleanup.
 # ---------------------------------------------------------------------
 set +e
-wait -n "$APACHE_PID" "$PROXY_PID" "$REDIS_PID"
+wait -n "$APACHE_PID" "$PROXY_PID" "$REDIS_PID" "$PG_WATCHDOG_PID"
 EXIT_CODE=$?
 set -e
 
 log "child exited (code=$EXIT_CODE); stopping container"
-kill -TERM "$APACHE_PID" "$PROXY_PID" "$REDIS_PID" 2>/dev/null || true
+kill -TERM "$APACHE_PID" "$PROXY_PID" "$REDIS_PID" "$PG_WATCHDOG_PID" 2>/dev/null || true
 su postgres -c "$PG_BIN/pg_ctl stop -D '$PG_DATA' -m fast" 2>/dev/null || true
 wait || true
 exit "$EXIT_CODE"
