@@ -7,9 +7,9 @@ app, with single sign-on via the OpenHost zone's `zone_auth` cookie.
 
 - The official upstream `nextcloud:33-apache` image, augmented with:
   - PostgreSQL (whatever the upstream image's Debian release ships;
-    currently PostgreSQL 15 on Bookworm), private to the container,
+    currently PostgreSQL 17 on Trixie), private to the container,
     listens on 127.0.0.1 only over TCP and unix-socket
-  - Redis (currently 7.x on Bookworm), private to the container,
+  - Redis (currently 8.x on Trixie), private to the container,
     used for file locking + memory cache
   - A small Python auth-sidecar in front of Apache that bridges
     OpenHost's `zone_auth` JWT cookie to Nextcloud's `user_saml` app

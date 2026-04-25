@@ -23,8 +23,11 @@ FROM nextcloud:33-apache
 ENV APACHE_PORT=8081
 
 # Layer PostgreSQL + Redis + Python onto the upstream image (which
-# is currently based on Debian Bookworm — that ships PostgreSQL 15,
-# which is what we get).
+# is currently based on Debian Trixie 13 — that ships PostgreSQL
+# 17 and Redis 8, which are what we get from the unversioned apt
+# package names below).  Operators reading this if/when the
+# upstream image rebases onto a newer Debian: ``cat /etc/os-release``
+# inside the running container to see the actual current value.
 #
 # postgresql-client is included so our supervisor shell can probe
 # Postgres readiness with ``pg_isready`` before launching Apache;

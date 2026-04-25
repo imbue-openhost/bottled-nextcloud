@@ -198,20 +198,19 @@ if [[ ! -f "$PG_DATA/PG_VERSION" ]]; then
     # image's php-pgsql can't easily be persuaded to use the unix
     # socket from PHP (it can technically, but the env-var driven
     # upstream entrypoint passes ``host=`` rather than the socket
-    # path).  pg_hba below ensures:
-    #   - The unix socket grants password-less access ONLY to the
-    #     ``postgres`` superuser (used by start.sh + provision_db
-    #     for bootstrap).  Other OS users in the container (notably
-    #     ``www-data`` running PHP, and ``redis``) get nothing on
-    #     the socket — they MUST go through TCP+md5, which requires
-    #     the password we generated.
-    #   - TCP from 127.0.0.1 uses md5 for everyone (including the
-    #     ``nextcloud`` role, the only one PHP knows the password
-    #     for).
-    #   - All other connectivity is rejected.
+    # path).  pg_hba below uses ``peer`` auth on the unix socket so
+    # the OS user identity is checked at the kernel level: the
+    # ``postgres`` OS user can authenticate as the ``postgres``
+    # role (used for bootstrap by start.sh + provision_db); any
+    # other OS user (including ``www-data`` running PHP) is
+    # rejected at the socket layer and MUST go through TCP + md5
+    # with the generated password.  ``trust`` would have allowed
+    # ``www-data`` (or any other OS user) to claim the postgres
+    # role passwordlessly — a real privilege-escalation gap.
     cat > "$PG_DATA/pg_hba.conf" <<'EOF'
-# OpenHost-managed: postgres superuser only on the unix socket.
-local   all postgres                  trust
+# OpenHost-managed: peer auth ties the postgres role to the
+# postgres OS user; reject all other socket connections.
+local   all postgres                  peer
 local   all all                       reject
 host    all all      127.0.0.1/32     md5
 host    all all      ::1/128          md5
