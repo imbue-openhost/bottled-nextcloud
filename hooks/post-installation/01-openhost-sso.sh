@@ -96,8 +96,17 @@ log "using user_saml config id=$SAML_CONFIG_ID"
 # display name will be the username, which is fine for a
 # single-owner deployment).
 occ --no-warnings saml:config:set --general-uid_mapping "HTTP_X_OPENHOST_USER" "$SAML_CONFIG_ID"
-occ --no-warnings saml:config:set --type "environment-variable" "$SAML_CONFIG_ID"
 occ --no-warnings saml:config:set --general-idp0_display_name "OpenHost SSO" "$SAML_CONFIG_ID"
+# The "type" field is not exposed via saml:config:set (which only
+# handles per-provider config keys).  user_saml reads its type from
+# a single app-wide config value via
+# ``$appConfig->getAppValueString('type')`` — see the v8 source
+# under apps/user_saml/lib/AppInfo/Application.php.  So we set
+# ``type=environment-variable`` on the user_saml app itself, which
+# is what tells the bootstrap (lib/base.php's
+# ``OC_User::handleApacheAuth()``) and the Sabre/WebDAV plugin
+# (DavPlugin.php) to honour the HTTP_X_OPENHOST_USER env var.
+occ --no-warnings config:app:set user_saml type --value="environment-variable"
 
 # Allow the local password-form login as well.  We need this for two
 # reasons:

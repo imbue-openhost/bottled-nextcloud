@@ -93,7 +93,9 @@ occ --no-warnings config:system:set overwritehost --value="$DOMAIN"
 if occ --no-warnings app:list --output=json 2>/dev/null \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if "user_saml" in (d.get("enabled") or {}) else 1)'; then
     occ --no-warnings saml:config:set --general-uid_mapping "HTTP_X_OPENHOST_USER" 1 || true
-    occ --no-warnings saml:config:set --type "environment-variable" 1 || true
+    # ``type`` is an app-wide config value (not a per-provider one);
+    # see the post-installation hook for context.
+    occ --no-warnings config:app:set user_saml type --value="environment-variable" || true
 fi
 
 log "before-starting hook complete"
