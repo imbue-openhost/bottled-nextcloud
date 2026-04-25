@@ -275,7 +275,26 @@ log "starting postgres"
 # child of our shell, so ``wait -n`` won't see it die.  We compensate
 # with the pg_isready watchdog later in the supervisor section, and
 # the EXIT trap above guarantees we tear it down on any exit path.
-su postgres -c "$PG_BIN/pg_ctl start -D '$PG_DATA' -l '$PG_LOG' -w -t 60 -o '-k /run/postgresql'"
+#
+# pg_ctl directs Postgres' own startup messages to ``$PG_LOG`` (a
+# file in the data dir), not to the supervisor's stderr.  If pg_ctl
+# fails, we'd otherwise see only a generic bash error.  Catch the
+# failure and tail the log into our stderr so the operator sees
+# the cause from container logs alone.
+if ! su postgres -c "$PG_BIN/pg_ctl start -D '$PG_DATA' -l '$PG_LOG' -w -t 60 -o '-k /run/postgresql'"; then
+    log "FATAL: pg_ctl start failed; recent postgres log lines follow:"
+    if [[ -r "$PG_LOG" ]]; then
+        # ``tail -n 50`` captures plenty of context without
+        # overwhelming the log; postgres errors are usually within
+        # the last few lines.
+        while IFS= read -r line; do
+            log "  pg: $line"
+        done < <(tail -n 50 "$PG_LOG" 2>/dev/null || echo "(could not read $PG_LOG)")
+    else
+        log "  (postgres log file at $PG_LOG is not readable)"
+    fi
+    exit 1
+fi
 
 # ---------------------------------------------------------------------
 # Provision nextcloud role + database
@@ -357,7 +376,19 @@ chown -R redis:redis "$REDIS_DIR" /run/redis 2>/dev/null || true
 # details.
 
 log "starting redis"
-redis-server "$REDIS_CONF" &
+# Drop redis to its dedicated ``redis`` user (the Debian package
+# creates the user + group) so it doesn't run as root.  Running
+# Redis as root triggers a startup warning and is a defense-in-
+# depth gap — a Redis RCE would otherwise have full container-root
+# privileges instead of being scoped to the redis user.  ``su`` is
+# used (rather than ``runuser``) for portability across the
+# multiple base images we may be derived from.
+if id redis >/dev/null 2>&1; then
+    su redis -s /bin/sh -c "redis-server '$REDIS_CONF'" &
+else
+    log "warning: 'redis' user not found; falling back to running redis-server as root"
+    redis-server "$REDIS_CONF" &
+fi
 REDIS_PID=$!
 
 # Wait for redis to be READY (responding to PING), not just alive.

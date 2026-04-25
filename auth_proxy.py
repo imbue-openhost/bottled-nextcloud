@@ -932,11 +932,14 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     continue
                 if ":" not in decoded:
                     # Malformed header line (no ``:`` separator).
-                    # Log at DEBUG so a buggy upstream silently
-                    # dropping headers leaves at least a faint trail
-                    # for an operator to find.
-                    log.debug(
-                        "skipping malformed response header line: %r", decoded
+                    # Log at WARNING because a dropped header could
+                    # silently corrupt the response (e.g., a bad
+                    # Content-Length or Set-Cookie).  Operators
+                    # should see this at the default log level so
+                    # they can investigate.
+                    log.warning(
+                        "dropping malformed response header line: %r",
+                        decoded,
                     )
                     continue
                 name, _, value = decoded.partition(":")
@@ -1109,10 +1112,11 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             return
 
     # Limits used by ``_copy_chunked`` to bound abuse.  An attacker or
-    # buggy peer that streams nothing but blank/trailer lines can pin
-    # a handler thread for ``STREAM_TIMEOUT_SECONDS`` (30 minutes)
-    # without these caps.  The values are generous enough that real
-    # traffic will never trip them.
+    # buggy peer that streams nothing but blank/trailer lines, or that
+    # emits an astronomical chunk-size value, can pin a handler thread
+    # for ``STREAM_TIMEOUT_SECONDS`` (30 minutes) without these caps.
+    # The values are generous enough that real traffic will never trip
+    # them.
     _CHUNKED_MAX_BLANK_LINES = 8
     _CHUNKED_MAX_TRAILER_LINES = 64
     # Cap the chunk-size header line.  RFC 9110 doesn't strictly bound
@@ -1120,6 +1124,12 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     # extensions).  An 8 KiB cap is far above any legitimate value
     # and keeps a single readline from buffering megabytes of input.
     _CHUNKED_LINE_CAP = 8192
+    # Cap the declared per-chunk size so a hostile upstream can't
+    # claim a multi-petabyte chunk and have us spin in the inner
+    # body-copy loop reading bytes until the 30-minute stream
+    # timeout fires.  16 GiB is an order of magnitude above the
+    # largest plausible legitimate single-chunk Nextcloud upload.
+    _CHUNKED_MAX_CHUNK_BYTES = 16 * 1024 * 1024 * 1024
 
     def _copy_chunked(self, src, dst) -> bool:
         """Copy a chunked transfer body verbatim from src to dst.
@@ -1178,6 +1188,12 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 size = int(decoded, 16)
             except ValueError:
                 log.warning("malformed chunk size: %r", size_line)
+                return False
+            if size < 0 or size > self._CHUNKED_MAX_CHUNK_BYTES:
+                log.warning(
+                    "chunk size %d outside acceptable range [0, %d]; aborting",
+                    size, self._CHUNKED_MAX_CHUNK_BYTES,
+                )
                 return False
             blank_lines_seen = 0
             # Validated: now safe to forward the size line.
@@ -1252,6 +1268,16 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     )
                     return False
                 crlf += more
+            # RFC 9112 §7.1 mandates these two bytes are CRLF.  A
+            # buggy or hostile upstream that sends anything else has
+            # corrupted the chunked framing — abort rather than
+            # forward the bad bytes and desync downstream.
+            if crlf != b"\r\n":
+                log.warning(
+                    "chunked stream framing error: post-chunk delimiter %r != CRLF",
+                    crlf,
+                )
+                return False
             dst.write(crlf)
 
 

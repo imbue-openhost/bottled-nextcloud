@@ -174,11 +174,16 @@ sys.exit(0 if "user_saml" in (d.get("enabled") or {}) else 1)'; then
     SAML_SLOT=""
     SAML_SLOT_OUT=$(occ --no-warnings saml:config:get --output=json 2>/dev/null || true)
     if [[ -n "$SAML_SLOT_OUT" ]]; then
-        SAML_SLOT=$(printf '%s' "$SAML_SLOT_OUT" | python3 -c '
+        # The python script tags JSON parse failures with a
+        # ``PARSE_ERROR:`` prefix on stderr (matching the post-install
+        # hook's pattern) so a corrupted occ output is distinguishable
+        # from a genuine 'no slots configured' state.
+        SAML_PARSE_OUT=$(printf '%s' "$SAML_SLOT_OUT" | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
-except Exception:
+except Exception as exc:
+    sys.stderr.write(f"PARSE_ERROR:{exc}\n")
     sys.exit(0)
 if isinstance(data, dict) and data:
     keys = []
@@ -189,20 +194,24 @@ if isinstance(data, dict) and data:
             keys.append((float("inf"), k))
     keys.sort()
     print(keys[0][1])
-' 2>/dev/null | tr -d '\n' || true)
+' 2>&1 || true)
+        if printf '%s' "$SAML_PARSE_OUT" | grep -q "^PARSE_ERROR:"; then
+            log "warning: saml:config:get output unparseable; falling back to slot 1"
+            log "  $SAML_PARSE_OUT"
+        else
+            SAML_SLOT=$(printf '%s' "$SAML_PARSE_OUT" | tr -d '\n')
+        fi
     fi
     if [[ -z "$SAML_SLOT" ]]; then
         log "warning: could not discover user_saml config slot; defaulting to 1"
         SAML_SLOT="1"
     fi
-    if ! occ --no-warnings saml:config:set --general-uid_mapping "HTTP_X_OPENHOST_USER" "$SAML_SLOT" >/dev/null 2>&1; then
-        log "warning: failed to re-stamp user_saml[$SAML_SLOT] general-uid_mapping (continuing)"
-    fi
+    occ_or_warn "saml:config:set user_saml[$SAML_SLOT] general-uid_mapping" \
+        saml:config:set --general-uid_mapping "HTTP_X_OPENHOST_USER" "$SAML_SLOT"
     # ``type`` is an app-wide config value (not a per-provider one);
     # see the post-installation hook for context.
-    if ! occ --no-warnings config:app:set user_saml type --value="environment-variable" >/dev/null 2>&1; then
-        log "warning: failed to re-stamp user_saml type=environment-variable (continuing)"
-    fi
+    occ_or_warn "config:app:set user_saml type=environment-variable" \
+        config:app:set user_saml type --value="environment-variable"
 elif [[ -z "$APP_LIST" ]]; then
     # ``occ app:list`` itself failed (DB not ready, occ binary moved,
     # PHP error).  Surface this distinctly from the silent
