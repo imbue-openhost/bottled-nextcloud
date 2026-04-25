@@ -603,9 +603,15 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                         "short request body: declared=%d actual=%d",
                         body_length, copied,
                     )
-                    # Upstream will see a short body — best we can do
-                    # is shut down the write side so it noticeably
-                    # fails parsing, and let it reply with 400 to us.
+                    # Half-close the write side so upstream sees EOF
+                    # promptly and replies (typically 400) rather than
+                    # waiting for the full STREAM_TIMEOUT_SECONDS for
+                    # the missing bytes.  Errors here are best-effort:
+                    # the socket may already be in an unusual state.
+                    try:
+                        upstream_sock.shutdown(socket.SHUT_WR)
+                    except OSError as exc:
+                        log.debug("upstream half-close failed: %s", exc)
             elif body_mode == "chunked":
                 # The standard library's
                 # http.server.BaseHTTPRequestHandler does NOT decode

@@ -337,8 +337,14 @@ log "starting nextcloud (apache2-foreground via upstream entrypoint)"
 APACHE_PID=$!
 
 # Wait for Apache to bind 127.0.0.1:8081 before starting the sidecar
-# so the very first request doesn't 502.
-for _ in $(seq 1 60); do
+# so the very first request doesn't 502.  We try ``APACHE_READY_TIMEOUT``
+# times at 1s intervals.  If Apache stays alive but never binds the
+# port (e.g. a misconfigured vhost that aborts during ServerName
+# resolution), we treat that as a fatal startup error rather than
+# silently letting the sidecar serve 502s indefinitely.
+APACHE_READY_TIMEOUT="${APACHE_READY_TIMEOUT:-90}"
+apache_ready=0
+for _ in $(seq 1 "$APACHE_READY_TIMEOUT"); do
     if APACHE_PORT="${APACHE_PORT:-8081}" python3 -c '
 import os, socket, sys
 s = socket.socket()
@@ -346,6 +352,7 @@ s.settimeout(0.5)
 sys.exit(0 if s.connect_ex(("127.0.0.1", int(os.environ["APACHE_PORT"]))) == 0 else 1)
 ' 2>/dev/null; then
         log "apache is listening"
+        apache_ready=1
         break
     fi
     if ! kill -0 "$APACHE_PID" 2>/dev/null; then
@@ -355,6 +362,12 @@ sys.exit(0 if s.connect_ex(("127.0.0.1", int(os.environ["APACHE_PORT"]))) == 0 e
     fi
     sleep 1
 done
+if [[ "$apache_ready" != "1" ]]; then
+    log "FATAL: apache did not bind 127.0.0.1:${APACHE_PORT:-8081} within ${APACHE_READY_TIMEOUT}s"
+    kill -TERM "$APACHE_PID" 2>/dev/null || true
+    wait "$APACHE_PID" || true
+    exit 1
+fi
 
 log "starting auth-proxy on :${AUTH_PROXY_LISTEN_PORT:-8080}"
 python3 /usr/local/bin/auth_proxy.py &

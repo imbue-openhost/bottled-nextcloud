@@ -90,12 +90,23 @@ occ --no-warnings config:system:set overwritehost --value="$DOMAIN"
 # user_saml's environment-variable mode reads $_SERVER['HTTP_X_OPENHOST_USER'].
 # Re-affirm the mapping every boot in case a future user_saml upgrade
 # resets it.  Slot 1 is what the post-installation hook created.
+#
+# We log warnings on failure (rather than ``|| true`` silently) so a
+# user_saml drift — e.g. an upgrade that renamed a CLI flag — is
+# visible in the container log instead of producing a silently
+# misconfigured SSO.  We still don't abort the boot: the previous
+# config still in config.php remains in place and a working SSO is
+# preferred over a crashing container.
 if occ --no-warnings app:list --output=json 2>/dev/null \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if "user_saml" in (d.get("enabled") or {}) else 1)'; then
-    occ --no-warnings saml:config:set --general-uid_mapping "HTTP_X_OPENHOST_USER" 1 || true
+    if ! occ --no-warnings saml:config:set --general-uid_mapping "HTTP_X_OPENHOST_USER" 1 >/dev/null 2>&1; then
+        log "warning: failed to re-stamp user_saml general-uid_mapping (continuing)"
+    fi
     # ``type`` is an app-wide config value (not a per-provider one);
     # see the post-installation hook for context.
-    occ --no-warnings config:app:set user_saml type --value="environment-variable" || true
+    if ! occ --no-warnings config:app:set user_saml type --value="environment-variable" >/dev/null 2>&1; then
+        log "warning: failed to re-stamp user_saml type=environment-variable (continuing)"
+    fi
 fi
 
 log "before-starting hook complete"

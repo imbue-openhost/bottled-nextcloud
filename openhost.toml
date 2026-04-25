@@ -30,9 +30,14 @@ memory_mb = 1536
 cpu_millicores = 1500
 
 [data]
-# Persistent: Postgres data, Nextcloud data dir (uploads + previews +
-# user profiles), Nextcloud config dir, custom_apps, app_data, the
-# auth-sidecar's cached JWKS, the generated admin password, etc.
+# Persistent: Postgres data, the generated postgres password, the
+# generated bootstrap admin password.  Nextcloud's own data/uploads
+# and config directories live inside the container at
+# ``/var/www/html/{data,config}`` and are persisted by the upstream
+# image's volumes (which OpenHost honours).  The auth-sidecar's JWKS
+# cache is in-memory only — it's refetched from the OpenHost router
+# on every container start, with stale fallback to handle a router
+# restart.
 app_data = true
 # Per-boot scratch: Apache logs, Postgres logs, Redis runtime state,
 # socket dirs.  Survives crashes but not redeploys.
