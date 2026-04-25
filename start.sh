@@ -97,8 +97,16 @@ load_or_generate() {
         # producing an empty ``current`` and unsafely regenerating
         # the password (which would de-sync our file from postgres'
         # role password and break every subsequent connection).
-        current=$(head -n1 "$file" 2>/dev/null)
-        head_rc=$?
+        #
+        # Append ``|| head_rc=$?`` to the substitution so a failed
+        # ``head`` doesn't trip ``set -e`` and exit the script
+        # before our diagnostic log line runs.  Without this guard,
+        # under bash 5.x the failed command-substitution can abort
+        # before ``head_rc=$?`` is evaluated, and the operator gets
+        # only a generic shell-error exit instead of our FATAL
+        # message.
+        head_rc=0
+        current=$(head -n1 "$file" 2>/dev/null) || head_rc=$?
         if [[ "$head_rc" -ne 0 ]]; then
             log "FATAL: failed to read $file (head exit $head_rc); not regenerating to avoid file/db drift"
             log "  if the file is genuinely corrupt, delete it and re-run; otherwise check permissions"
