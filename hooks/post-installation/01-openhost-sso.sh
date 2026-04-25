@@ -201,16 +201,14 @@ occ --no-warnings config:system:set upgrade.disable-web --type=boolean --value=t
 
 # Default phone region (used by the ``user_phone_provisioning`` flow,
 # search by phone number, etc.).  Only set if not already configured.
-# Check whether ``default_phone_region`` is already set.  We want to
-# distinguish three cases: (a) already set → skip; (b) not set →
-# set to default; (c) occ failed → don't silently treat as
-# unset (which would write the default and mask the failure).
-# Capture stdout and exit code separately rather than letting
-# pipefail collapse them.
-PHONE_OUT=$(occ --no-warnings config:system:get default_phone_region 2>/dev/null) || PHONE_OUT="<<OCCFAIL>>"
-if [[ "$PHONE_OUT" == "<<OCCFAIL>>" ]]; then
-    log "warning: occ config:system:get default_phone_region failed; not setting default"
-elif [[ -z "$PHONE_OUT" ]]; then
+# Check whether ``default_phone_region`` is already set, then set
+# the default if not.  We use ``--default-value=__UNSET__`` so that
+# an unset key returns the sentinel and exit 0 — without the
+# default-value flag, ``config:system:get`` returns exit 1 for an
+# unset key, which is indistinguishable from a real occ failure
+# under ``set -e``.
+PHONE_REGION=$(occ --no-warnings config:system:get default_phone_region --default-value=__UNSET__ 2>/dev/null || true)
+if [[ "$PHONE_REGION" == "__UNSET__" ]]; then
     occ --no-warnings config:system:set default_phone_region --value="US"
 fi
 
