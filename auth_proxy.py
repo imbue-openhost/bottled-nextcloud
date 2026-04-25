@@ -141,7 +141,18 @@ PUBLIC_PATH_PATTERNS = [
 
 
 def _is_public_path(path: str) -> bool:
-    return any(p.match(path) for p in PUBLIC_PATH_PATTERNS)
+    """Return True if ``path`` matches one of the SSO-bypass patterns.
+
+    The argument is the raw HTTP request-target as ``BaseHTTPRequestHandler``
+    receives it — including any query string.  Strip the query string
+    before matching so that, e.g., ``/csrftoken?foo=bar`` matches
+    ``^/csrftoken$``.  Also strip a fragment defensively (clients
+    don't send fragments to servers per RFC 9110, but be liberal).
+    """
+    # ``str.split(sep, 1)[0]`` is faster than parsing a full URL and
+    # handles the simple "is there a ? or # in the path" case fine.
+    path_only = path.split("?", 1)[0].split("#", 1)[0]
+    return any(p.match(path_only) for p in PUBLIC_PATH_PATTERNS)
 
 
 logging.basicConfig(
@@ -214,13 +225,11 @@ class JwksCache:
                 log.warning("JWKS fetch failed and no cache: %s", exc)
                 raise
 
-            # Update both fields atomically while holding the cache
-            # lock.  Order matters: we set ``_fetched_at`` BEFORE
-            # ``_keys`` so a concurrent reader observing the new
-            # ``_keys`` is guaranteed to also see the matching
-            # ``_fetched_at`` — the alternative ordering can leave
-            # a thread thinking the brand-new keys are stale and
-            # immediately scheduling another refresh.
+            # Update both fields under the cache lock.  All readers
+            # of ``_keys`` and ``_fetched_at`` also acquire
+            # ``_cache_lock`` (see ``get`` and the early-return at
+            # the top of ``_fetch_lock``), so they observe the two
+            # writes as a single atomic update — no torn reads.
             now = time.time()
             with self._cache_lock:
                 self._fetched_at = now
@@ -263,6 +272,7 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.warning("JWKS unavailable; denying owner check: %s", exc)
         return False
+    last_error: jwt.PyJWTError | None = None
     for key in keys:
         try:
             claims = jwt.decode(
@@ -274,10 +284,27 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
                     "verify_aud": False,
                 },
             )
-        except jwt.PyJWTError:
+        except jwt.PyJWTError as exc:
+            # Capture for diagnostic logging if every key fails.  We
+            # still have to try every key because a JWKS rotation
+            # window can have a token signed under the previous key
+            # while the new key is also published.
+            last_error = exc
             continue
         if claims.get("sub") == "owner":
             return True
+    if last_error is not None:
+        # Log at DEBUG (not INFO/WARNING) because failed JWT
+        # verifications are common and noisy: any anonymous request
+        # without zone_auth, an expired session, or a third-party
+        # request reaches this path.  Operators investigating "why
+        # can't I log in?" can crank AUTH_PROXY_LOG_LEVEL=DEBUG to
+        # see the per-token failure type (ExpiredSignatureError,
+        # InvalidSignatureError, MissingRequiredClaimError, etc.).
+        log.debug(
+            "JWT verification failed against all %d JWKS key(s): %s: %s",
+            len(keys), type(last_error).__name__, last_error,
+        )
     return False
 
 
@@ -620,40 +647,54 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         # query string.  ``self.path`` already has it.  Per RFC 9110
         # §3.2 the request-target on an origin-form URL is the
         # ``absolute-path [ "?" query ]`` part.
-        request_line = f"{self.command} {self.path} HTTP/1.1\r\n"
-        upstream_writer.write(self._encode_header_bytes(request_line))
-        # Always send a Host header.
-        upstream_writer.write(
-            self._encode_header_bytes(
-                f"Host: {self.upstream_host}:{self.upstream_port}\r\n"
-            )
-        )
-        for key, value in cleaned_headers:
+        try:
+            request_line = f"{self.command} {self.path} HTTP/1.1\r\n"
+            upstream_writer.write(self._encode_header_bytes(request_line))
+            # Always send a Host header.
             upstream_writer.write(
-                self._encode_header_bytes(f"{key}: {value}\r\n")
+                self._encode_header_bytes(
+                    f"Host: {self.upstream_host}:{self.upstream_port}\r\n"
+                )
             )
+            for key, value in cleaned_headers:
+                upstream_writer.write(
+                    self._encode_header_bytes(f"{key}: {value}\r\n")
+                )
+        except OSError as exc:
+            # Apache restarted mid-write, or the upstream socket
+            # closed before we finished the headers.  Don't let the
+            # exception propagate as a dropped connection — return a
+            # proper 502.
+            log.warning("upstream write failed during request headers: %s", exc)
+            self._safe_send_error(502, "Bad Gateway")
+            return
         # Re-state the framing.  We dropped the original
         # Content-Length / Transfer-Encoding via HOP_BY_HOP_HEADERS
         # so re-add the right one for the upstream.
-        if body_mode == "chunked":
-            upstream_writer.write(b"Transfer-Encoding: chunked\r\n")
-        elif body_mode == "fixed":
-            upstream_writer.write(
-                f"Content-Length: {body_length}\r\n".encode("latin-1")
-            )
-        elif body_mode == "none":
-            # Methods that traditionally have a body (POST/PUT/PATCH)
-            # without explicit framing get a Content-Length: 0 so
-            # Apache doesn't wait for EOF.  Methods without bodies
-            # (GET/HEAD/DELETE) don't strictly need it but it doesn't
-            # hurt — and is more deterministic than relying on Apache
-            # inferring from the verb.
-            upstream_writer.write(b"Content-Length: 0\r\n")
-        # We only speak HTTP/1.1 to upstream.  Force ``Connection: close``
-        # so the upstream signals end-of-response cleanly and we don't
-        # have to track keep-alive state across the proxy.
-        upstream_writer.write(b"Connection: close\r\n")
-        upstream_writer.write(b"\r\n")
+        try:
+            if body_mode == "chunked":
+                upstream_writer.write(b"Transfer-Encoding: chunked\r\n")
+            elif body_mode == "fixed":
+                upstream_writer.write(
+                    f"Content-Length: {body_length}\r\n".encode("latin-1")
+                )
+            elif body_mode == "none":
+                # Methods that traditionally have a body (POST/PUT/PATCH)
+                # without explicit framing get a Content-Length: 0 so
+                # Apache doesn't wait for EOF.  Methods without bodies
+                # (GET/HEAD/DELETE) don't strictly need it but it doesn't
+                # hurt — and is more deterministic than relying on Apache
+                # inferring from the verb.
+                upstream_writer.write(b"Content-Length: 0\r\n")
+            # We only speak HTTP/1.1 to upstream.  Force ``Connection: close``
+            # so the upstream signals end-of-response cleanly and we don't
+            # have to track keep-alive state across the proxy.
+            upstream_writer.write(b"Connection: close\r\n")
+            upstream_writer.write(b"\r\n")
+        except OSError as exc:
+            log.warning("upstream write failed during framing headers: %s", exc)
+            self._safe_send_error(502, "Bad Gateway")
+            return
 
         # ---- write request body ----
         try:
@@ -854,57 +895,93 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             log.debug("IO error streaming response body: %s", exc)
             return
 
+    # Limits used by ``_copy_chunked`` to bound abuse.  An attacker or
+    # buggy peer that streams nothing but blank/trailer lines can pin
+    # a handler thread for ``STREAM_TIMEOUT_SECONDS`` (30 minutes)
+    # without these caps.  The values are generous enough that real
+    # traffic will never trip them.
+    _CHUNKED_MAX_BLANK_LINES = 8
+    _CHUNKED_MAX_TRAILER_LINES = 64
+    # Cap the chunk-size header line.  RFC 9110 doesn't strictly bound
+    # it, but in practice it's <20 bytes (a hex size + optional
+    # extensions).  An 8 KiB cap is far above any legitimate value
+    # and keeps a single readline from buffering megabytes of input.
+    _CHUNKED_LINE_CAP = 8192
+
     def _copy_chunked(self, src, dst) -> None:
         """Copy a chunked transfer body verbatim from src to dst.
 
         We don't decode the chunks — the encoding is preserved
         end-to-end — but we DO need to detect the terminating
         ``0\\r\\n\\r\\n`` chunk so we know when the body ends.
+
+        Validation strategy: parse each chunk-size line BEFORE
+        forwarding it.  If the line is malformed (not hex, no
+        terminating newline, etc.), abort without writing the bad
+        bytes — that way the caller sees a clean truncation rather
+        than a corrupted partial chunk header in the stream.
         """
-        # Read the chunk-size line, write it through, read that
-        # many bytes plus the trailing CRLF, write through, repeat
-        # until size is 0; then read trailers (zero or more header
-        # lines terminated by blank line) and write through.
-        #
-        # Cap the number of "tolerated" stray blank lines so a
-        # malicious or buggy source streaming nothing but ``\r\n``
-        # cannot pin a handler thread for the full
-        # STREAM_TIMEOUT_SECONDS.
-        MAX_BLANK_LINES = 8
         blank_lines_seen = 0
         while True:
-            size_line = src.readline(8192)
+            size_line = src.readline(self._CHUNKED_LINE_CAP)
             if not size_line:
-                # Source closed mid-stream — propagate and let caller
-                # detect the truncated stream.
+                # Source closed mid-stream.
                 return
-            dst.write(size_line)
-            # Strip any chunk-extensions after a ``;``.
+            # readline() returns up to N bytes; an N-byte return
+            # without a terminating newline means the line was
+            # truncated and we don't know whether the next bytes are
+            # a continuation or a fresh chunk.  Bail rather than
+            # forwarding garbage.
+            if not size_line.endswith((b"\n",)):
+                log.warning(
+                    "chunk-size line exceeds %d bytes; aborting stream",
+                    self._CHUNKED_LINE_CAP,
+                )
+                return
             decoded = size_line.split(b";", 1)[0].strip()
             if not decoded:
-                # Tolerate a stray blank line at the start (RFC
-                # tolerance for "be liberal in what you accept"), but
-                # cap the count so an infinite stream of blank lines
-                # can't spin forever.
+                # Stray blank line.  Cap so an infinite stream of
+                # blank lines can't spin forever.  We DO forward
+                # the blank line — it's a tolerated byte sequence,
+                # not a corrupted one.
                 blank_lines_seen += 1
-                if blank_lines_seen > MAX_BLANK_LINES:
+                if blank_lines_seen > self._CHUNKED_MAX_BLANK_LINES:
                     log.warning(
                         "too many blank chunk-size lines (%d); aborting stream",
                         blank_lines_seen,
                     )
                     return
+                dst.write(size_line)
                 continue
-            blank_lines_seen = 0
             try:
                 size = int(decoded, 16)
             except ValueError:
                 log.warning("malformed chunk size: %r", size_line)
                 return
+            blank_lines_seen = 0
+            # Validated: now safe to forward the size line.
+            dst.write(size_line)
             if size == 0:
                 # Read trailers until empty line, write through.
+                # Cap the number of trailer lines so an unterminated
+                # trailer stream can't pin the thread.
+                trailers_seen = 0
                 while True:
-                    trailer = src.readline(8192)
+                    trailer = src.readline(self._CHUNKED_LINE_CAP)
                     if not trailer:
+                        return
+                    if not trailer.endswith((b"\n",)):
+                        log.warning(
+                            "trailer line exceeds %d bytes; aborting stream",
+                            self._CHUNKED_LINE_CAP,
+                        )
+                        return
+                    trailers_seen += 1
+                    if trailers_seen > self._CHUNKED_MAX_TRAILER_LINES:
+                        log.warning(
+                            "too many trailer lines (%d); aborting stream",
+                            trailers_seen,
+                        )
                         return
                     dst.write(trailer)
                     if trailer in (b"\r\n", b"\n"):

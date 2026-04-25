@@ -69,11 +69,18 @@ log in via the bootstrap admin password (saved to
 3. Nextcloud mints an **app password** scoped to that client and
    returns it to the client process.
 4. From then on the client uses HTTP Basic Auth (`username:app-password`)
-   against `/remote.php/dav/*`, `/remote.php/webdav/*`, and `/ocs/*`.
-   These paths are listed in `auth_proxy.py`'s `PUBLIC_PATH_PATTERNS`
-   and are passed through with the `Authorization` header intact and
-   **no** `X-Openhost-User` stamped — Nextcloud authenticates them
-   via the app password directly.
+   against any path listed in `auth_proxy.py`'s `PUBLIC_PATH_PATTERNS`.
+   The full list (kept current in code, summarised here) covers:
+   `/remote.php/dav/*`, `/remote.php/webdav/*`, `/ocs/*`,
+   the legacy `/caldav` and `/carddav` aliases, `/status.php`,
+   `/.well-known/*`, `/login/v2*` and `/index.php/login/v2*` (the
+   pairing flow itself), public file shares (`/s/<id>`,
+   `/index.php/s/<id>`, `/public.php`, `/index.php/public.php`),
+   and the CSRF-token bootstrap (`/csrftoken`, `/index.php/csrftoken`).
+   Requests on these paths pass through with the `Authorization`
+   header intact and **no** `X-Openhost-User` stamped — Nextcloud
+   authenticates them via the app password (or share token, or
+   anonymous public access) directly.
 
 The result is that revoking a client (Settings → Security → revoke
 the app password) immediately disconnects that one device without
@@ -150,7 +157,10 @@ Upgrades happen only by rebuilding the image with a newer base.
 | `NEXTCLOUD_DOMAIN` | `${OPENHOST_APP_NAME}.${OPENHOST_ZONE_DOMAIN}` | The public hostname the app is served at; used for `trusted_domains` and `overwrite.*`. |
 | `AUTH_PROXY_LISTEN_PORT` | `8080` | The port the auth-sidecar binds. Must match `[runtime.container].port` in `openhost.toml`. |
 | `APACHE_PORT` | `8081` | The port Apache binds inside the container. The auth-sidecar proxies to `127.0.0.1:$APACHE_PORT`. |
-| `AUTH_PROXY_LOG_LEVEL` | `INFO` | Python logging level for the sidecar. |
+| `APACHE_READY_TIMEOUT` | `90` | Seconds to wait for Apache to bind its listening port before declaring startup failed. |
+| `REDIS_READY_TIMEOUT` | `30` | Seconds to wait for Redis to respond to PING before declaring startup failed. |
+| `PG_WATCHDOG_INTERVAL` | `15` | Seconds between Postgres `pg_isready` probes. Three consecutive failures terminate the container so OpenHost restarts it. |
+| `AUTH_PROXY_LOG_LEVEL` | `INFO` | Python logging level for the sidecar. Set to `DEBUG` to log per-token JWT verification failures (helpful for diagnosing "I can't log in"). |
 
 The Nextcloud image's standard env vars (`POSTGRES_*`, `REDIS_*`,
 `NEXTCLOUD_TRUSTED_DOMAINS`, `TRUSTED_PROXIES`, `OVERWRITEHOST`,

@@ -115,7 +115,7 @@ occ_or_warn "config:system:set overwritehost" \
 
 # user_saml's environment-variable mode reads $_SERVER['HTTP_X_OPENHOST_USER'].
 # Re-affirm the mapping every boot in case a future user_saml upgrade
-# resets it.  Slot 1 is what the post-installation hook created.
+# resets it.
 #
 # We log warnings on failure (rather than ``|| true`` silently) so a
 # user_saml drift — e.g. an upgrade that renamed a CLI flag — is
@@ -123,16 +123,56 @@ occ_or_warn "config:system:set overwritehost" \
 # misconfigured SSO.  We still don't abort the boot: the previous
 # config still in config.php remains in place and a working SSO is
 # preferred over a crashing container.
-if occ --no-warnings app:list --output=json 2>/dev/null \
-        | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if "user_saml" in (d.get("enabled") or {}) else 1)'; then
-    if ! occ --no-warnings saml:config:set --general-uid_mapping "HTTP_X_OPENHOST_USER" 1 >/dev/null 2>&1; then
-        log "warning: failed to re-stamp user_saml general-uid_mapping (continuing)"
+APP_LIST=$(occ --no-warnings app:list --output=json 2>/dev/null || true)
+if printf '%s' "$APP_LIST" | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+sys.exit(0 if "user_saml" in (d.get("enabled") or {}) else 1)'; then
+    # Discover which user_saml config slot to update.  The
+    # post-installation hook prefers the first existing slot if any
+    # were present at install time (which can be non-1) and only
+    # falls back to creating a slot 1 when none exist.  Re-discover
+    # the same slot here so a deployment with an existing slot 2 (or
+    # higher) doesn't get its config 1 silently re-stamped.  If
+    # discovery fails we fall back to slot 1 — same behavior as
+    # before, but with a logged warning.
+    SAML_SLOT=""
+    SAML_SLOT_OUT=$(occ --no-warnings saml:config:list --output=json 2>/dev/null || true)
+    if [[ -n "$SAML_SLOT_OUT" ]]; then
+        SAML_SLOT=$(printf '%s' "$SAML_SLOT_OUT" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(data, dict) and data:
+    print(next(iter(data.keys())))
+elif isinstance(data, list) and data:
+    item = data[0]
+    if isinstance(item, dict):
+        print(item.get("id", ""))
+' 2>/dev/null | tr -d '\n' || true)
+    fi
+    if [[ -z "$SAML_SLOT" ]]; then
+        log "warning: could not discover user_saml config slot; defaulting to 1"
+        SAML_SLOT="1"
+    fi
+    if ! occ --no-warnings saml:config:set --general-uid_mapping "HTTP_X_OPENHOST_USER" "$SAML_SLOT" >/dev/null 2>&1; then
+        log "warning: failed to re-stamp user_saml[$SAML_SLOT] general-uid_mapping (continuing)"
     fi
     # ``type`` is an app-wide config value (not a per-provider one);
     # see the post-installation hook for context.
     if ! occ --no-warnings config:app:set user_saml type --value="environment-variable" >/dev/null 2>&1; then
         log "warning: failed to re-stamp user_saml type=environment-variable (continuing)"
     fi
+elif [[ -z "$APP_LIST" ]]; then
+    # ``occ app:list`` itself failed (DB not ready, occ binary moved,
+    # PHP error).  Surface this distinctly from the silent
+    # "user_saml not enabled" case so an operator investigating a
+    # silent SSO failure has a hint to look at the database.
+    log "warning: occ app:list returned no output; cannot re-stamp user_saml settings"
 fi
 
 log "before-starting hook complete"
