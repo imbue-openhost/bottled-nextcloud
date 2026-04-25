@@ -126,16 +126,30 @@ fi
 if [[ -z "$SAML_CONFIG_ID" ]]; then
     log "creating fresh user_saml config"
     # ``saml:config:create`` echoes the new provider ID as the
-    # entirety of stdout (just a number, no decoration).  Capture it
-    # so we don't blindly assume slot 1 — a re-bootstrap on a data
-    # dir that already had partial slots could allocate slot 4 etc.
-    NEW_ID=$(occ --no-warnings saml:config:create 2>/dev/null | tr -d '\r\n[:space:]' || true)
+    # entirety of stdout (just a number, no decoration).  Capture
+    # both stdout and stderr separately so that a failure (DB
+    # error, missing user_saml app, ...) shows up in the log as a
+    # diagnostic line, rather than silently falling back to slot 1
+    # with no clue why.
+    CREATE_ERR=""
+    CREATE_ERR=$(mktemp 2>/dev/null) || CREATE_ERR=""
+    if [[ -n "$CREATE_ERR" ]]; then
+        NEW_ID=$(occ --no-warnings saml:config:create 2>"$CREATE_ERR" | tr -d '\r\n[:space:]' || true)
+    else
+        NEW_ID=$(occ --no-warnings saml:config:create 2>/dev/null | tr -d '\r\n[:space:]' || true)
+    fi
     if [[ "$NEW_ID" =~ ^[0-9]+$ ]]; then
         SAML_CONFIG_ID="$NEW_ID"
     else
         log "warning: saml:config:create returned non-numeric output ($NEW_ID); defaulting to 1"
+        if [[ -n "$CREATE_ERR" && -s "$CREATE_ERR" ]]; then
+            while IFS= read -r line; do
+                log "  saml:config:create stderr: $line"
+            done < "$CREATE_ERR"
+        fi
         SAML_CONFIG_ID="1"
     fi
+    [[ -n "$CREATE_ERR" ]] && rm -f "$CREATE_ERR" 2>/dev/null
 fi
 log "using user_saml config id=$SAML_CONFIG_ID"
 

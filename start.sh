@@ -104,12 +104,26 @@ load_or_generate() {
             log "  if the file is genuinely corrupt, delete it and re-run; otherwise check permissions"
             exit 1
         fi
-        current=$(printf '%s' "$current" | tr -d '\r\n')
-        if [[ -n "$current" ]]; then
+        # Detect "all-whitespace" content (including only spaces /
+        # tabs / CR / LF) as corrupt.  Use a separate check that
+        # doesn't mangle the actual returned password — we want to
+        # preserve any internal characters the operator might have
+        # set.  Trim trailing whitespace (newline / CR from openssl,
+        # plus any operator-added trailing space) but leave the
+        # body alone.
+        local stripped_check
+        stripped_check=$(printf '%s' "$current" | tr -d '[:space:]')
+        if [[ -z "$stripped_check" ]]; then
+            log "warning: $file present but empty/whitespace-only; regenerating"
+        else
+            # Trim trailing whitespace only; the password itself
+            # must not have internal whitespace under our own
+            # generator (openssl rand -hex 16) but operator edits
+            # might inadvertently add it, so we don't fully strip.
+            current="${current%"${current##*[![:space:]]}"}"
             printf '%s' "$current"
             return
         fi
-        log "warning: $file present but empty/corrupt; regenerating"
     fi
     local fresh
     if ! fresh=$(openssl rand -hex 16); then

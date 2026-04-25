@@ -6,9 +6,11 @@ app, with single sign-on via the OpenHost zone's `zone_auth` cookie.
 ## What you get
 
 - The official upstream `nextcloud:33-apache` image, augmented with:
-  - PostgreSQL 17 (private to the container, listens on loopback only)
-  - Redis 7 (private to the container, loopback only, used for file
-    locking + memory cache)
+  - PostgreSQL (whatever the upstream image's Debian release ships;
+    currently PostgreSQL 15 on Bookworm), private to the container,
+    listens on 127.0.0.1 only over TCP and unix-socket
+  - Redis (currently 7.x on Bookworm), private to the container,
+    used for file locking + memory cache
   - A small Python auth-sidecar in front of Apache that bridges
     OpenHost's `zone_auth` JWT cookie to Nextcloud's `user_saml` app
     in environment-variable mode
@@ -179,7 +181,7 @@ Upgrades happen only by rebuilding the image with a newer base.
 | `NEXTCLOUD_ADMIN_USER` | `admin` | The local Nextcloud user that the auth-sidecar's `X-Openhost-User` stamp identifies. user_saml auto-creates this account on first SSO login. |
 | `NEXTCLOUD_DOMAIN` | `${OPENHOST_APP_NAME}.${OPENHOST_ZONE_DOMAIN}` | The public hostname the app is served at; used for `trusted_domains` and `overwrite.*`. |
 | `AUTH_PROXY_LISTEN_PORT` | `8080` | The port the auth-sidecar binds. Must match `[runtime.container].port` in `openhost.toml`. |
-| `APACHE_PORT` | `8081` | The port Apache binds inside the container. The auth-sidecar proxies to `127.0.0.1:$APACHE_PORT`. |
+| `APACHE_PORT` | `8081` | Build-time only. The port Apache binds inside the container; the auth-sidecar proxies to `127.0.0.1:$APACHE_PORT`. The value is set in the Dockerfile via `ENV` and baked into Apache's `ports.conf` and the default vhost via `sed`, so a runtime override would desync the two. Operators wanting a different port must rebuild the image. |
 | `APACHE_READY_TIMEOUT` | `90` | Seconds to wait for Apache to bind its listening port before declaring startup failed. |
 | `REDIS_READY_TIMEOUT` | `30` | Seconds to wait for Redis to respond to PING before declaring startup failed. |
 | `PG_WATCHDOG_INTERVAL` | `15` | Seconds between Postgres `pg_isready` probes. Three consecutive failures terminate the container so OpenHost restarts it. |

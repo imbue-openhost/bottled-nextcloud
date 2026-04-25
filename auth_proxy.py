@@ -70,7 +70,13 @@ from typing import AbstractSet, Iterable
 import jwt
 import requests
 
-AUTH_HEADER_NAME = "X-Openhost-User"
+# HTTP header names are case-insensitive on the wire (RFC 9110
+# §5.1), so the casing we choose only matters for our own logs and
+# for any operator searching the codebase.  The OpenHost router
+# emits ``X-OpenHost-Is-Owner`` and Nextcloud's user_saml app reads
+# ``HTTP_X_OPENHOST_USER`` (PHP normalises header case via the
+# server-variable name); both representations match these constants.
+AUTH_HEADER_NAME = "X-OpenHost-User"
 OWNER_HEADER_NAME = "X-OpenHost-Is-Owner"
 ZONE_COOKIE = "zone_auth"
 JWKS_PATH = "/.well-known/jwks.json"
@@ -756,6 +762,16 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             return
 
         # ---- write request body ----
+        # ``request_truncated`` becomes True if either the
+        # fixed-length or chunked body path detects a short body /
+        # malformed chunk stream and half-closes the upstream write
+        # side.  In that state the buffered writer's FD is no longer
+        # writable and any further flush would raise BrokenPipeError;
+        # we therefore skip the post-body flush entirely and proceed
+        # straight to reading the upstream's reply (which will
+        # typically be a 400 Bad Request that we forward to the
+        # client).
+        request_truncated = False
         try:
             if body_mode == "fixed" and body_length > 0:
                 reader = _CappedReader(self.rfile, body_length)
@@ -765,15 +781,21 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                         "short request body: declared=%d actual=%d",
                         body_length, copied,
                     )
-                    # Half-close the write side so upstream sees EOF
-                    # promptly and replies (typically 400) rather than
-                    # waiting for the full STREAM_TIMEOUT_SECONDS for
-                    # the missing bytes.  Errors here are best-effort:
-                    # the socket may already be in an unusual state.
+                    # Flush BEFORE the half-close.  A flush() on a
+                    # writer whose write side is already shut down
+                    # raises BrokenPipeError; doing it in the right
+                    # order lets the bytes we have actually reach
+                    # Apache, then the SHUT_WR delivers EOF so
+                    # Apache stops waiting for more.
+                    try:
+                        upstream_writer.flush()
+                    except OSError as exc:
+                        log.debug("flush before half-close failed: %s", exc)
                     try:
                         upstream_sock.shutdown(socket.SHUT_WR)
                     except OSError as exc:
                         log.debug("upstream half-close failed: %s", exc)
+                    request_truncated = True
             elif body_mode == "chunked":
                 # The standard library's
                 # http.server.BaseHTTPRequestHandler does NOT decode
@@ -787,12 +809,6 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                         "chunked request body forwarded with truncation; "
                         "upstream may see a malformed request"
                     )
-                    # Half-close the write side so Apache sees EOF
-                    # promptly and replies with 400 (matching the
-                    # behaviour of the fixed-length truncation path
-                    # above).  Without this, Apache would wait for
-                    # more chunk data and pin the handler thread for
-                    # the full STREAM_TIMEOUT_SECONDS.
                     try:
                         upstream_writer.flush()
                     except OSError as exc:
@@ -801,18 +817,24 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                         upstream_sock.shutdown(socket.SHUT_WR)
                     except OSError as exc:
                         log.debug("upstream half-close failed: %s", exc)
+                    request_truncated = True
         except (OSError, TimeoutError) as exc:
             log.info("client/upstream IO error during request body: %s", exc)
             self._safe_send_error(502, "Bad Gateway")
             return
 
-        # Flush the request-side bytes.
-        try:
-            upstream_writer.flush()
-        except OSError as exc:
-            log.warning("upstream flush failed: %s", exc)
-            self._safe_send_error(502, "Bad Gateway")
-            return
+        # Flush the request-side bytes — but only if we haven't
+        # already shut down the write side (request_truncated case).
+        # A flush after SHUT_WR raises BrokenPipeError, which would
+        # 502 the client even though the upstream is about to send a
+        # legitimate 400 Bad Request that we want to forward.
+        if not request_truncated:
+            try:
+                upstream_writer.flush()
+            except OSError as exc:
+                log.warning("upstream flush failed: %s", exc)
+                self._safe_send_error(502, "Bad Gateway")
+                return
 
         # ---- read response status + headers ----
         #
@@ -909,7 +931,13 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     )
                     continue
                 if ":" not in decoded:
-                    # Skip malformed lines silently.
+                    # Malformed header line (no ``:`` separator).
+                    # Log at DEBUG so a buggy upstream silently
+                    # dropping headers leaves at least a faint trail
+                    # for an operator to find.
+                    log.debug(
+                        "skipping malformed response header line: %r", decoded
+                    )
                     continue
                 name, _, value = decoded.partition(":")
                 resp_headers.append([name.strip(), value.strip()])
@@ -963,16 +991,32 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 try:
                     parsed_cl = int(v.strip())
                 except ValueError:
-                    resp_cl = None
+                    log.warning(
+                        "upstream sent non-integer Content-Length %r; "
+                        "ignoring this header",
+                        v,
+                    )
                     continue
                 if parsed_cl < 0:
                     log.warning(
                         "upstream sent negative Content-Length %d; ignoring",
                         parsed_cl,
                     )
-                    resp_cl = None
                     continue
-                resp_cl = parsed_cl
+                # Use the FIRST valid Content-Length we see; per
+                # RFC 9110 §8.6 a duplicate Content-Length is a
+                # protocol error but a robust intermediary should
+                # not lose a valid value because of one.  Mismatched
+                # duplicates are warned about so an operator can
+                # investigate.
+                if resp_cl is not None and resp_cl != parsed_cl:
+                    log.warning(
+                        "upstream sent conflicting Content-Length values "
+                        "%d and %d; using first",
+                        resp_cl, parsed_cl,
+                    )
+                elif resp_cl is None:
+                    resp_cl = parsed_cl
         if "chunked" in resp_te_parts:
             resp_te = "chunked"
 
