@@ -120,56 +120,76 @@ log "DATA_DIR=$DATA_DIR"
 #                      re-running ``maintenance:install`` against the
 #                      already-populated Postgres database.
 #
-# The upstream entrypoint's rsync only (re)seeds config/data/custom_apps/
-# themes when the target is an EMPTY directory (``directory_empty``).
-# A symlink pointing at an already-populated persistent dir is not
-# empty, so subsequent boots leave it untouched; on first boot the
-# targets are empty and the entrypoint populates them (writing through
-# the symlinks into persistent storage).
+# Why seed from /usr/src/nextcloud, not from the volume's own copy:
+# the upstream entrypoint reseeds config/data/custom_apps/themes from
+# /usr/src/nextcloud ONLY when the target directory is EMPTY
+# (``directory_empty`` in /entrypoint.sh) — and when it does, its
+# rsync REPLACES our symlink with a real directory, silently breaking
+# persistence (the symptom that bit an earlier revision: config.php
+# landed in the ephemeral volume, not app_data, so it vanished on the
+# next rebuild).  By seeding the persistent target from the image's
+# own /usr/src/nextcloud/<item> the symlink is never empty, so the
+# entrypoint skips its reseed rsync and leaves the symlink intact.
+# The install/upgrade then writes config.php + version.php THROUGH the
+# symlink into app_data, where they survive rebuilds.
 #
 # We do NOT symlink the whole tree: the bulk of /var/www/html is
 # immutable image code that should track the image, and a bind mount
 # (the obvious whole-tree alternative) is denied under rootless podman.
+IMAGE_SRC="/usr/src/nextcloud"
+# The Nextcloud user data dir lives entirely in app_data and is passed
+# to the upstream install via NEXTCLOUD_DATA_DIR (see the env block
+# below).  The entrypoint never rsyncs into an external data dir, so
+# no symlink games are needed for it — it just works.
+PERSIST_DATA_DIR="$HTML_PERSIST/data"
+
 relocate_html_state() {
-    local item target
-    for item in config data custom_apps themes version.php; do
+    local item target src
+    # config/, custom_apps/ and themes/ are symlinked into app_data.
+    # We seed each persistent target ONCE from the IMAGE source
+    # (/usr/src/nextcloud/<item>), NOT from the ephemeral volume copy,
+    # so the target is non-empty.  A non-empty target makes the
+    # entrypoint's ``directory_empty`` check false, so it skips the
+    # reseed rsync that would otherwise REPLACE our symlink with a
+    # real directory (the bug that broke persistence before).  The
+    # install/upgrade then writes config.php THROUGH the symlink into
+    # app_data.
+    for item in config custom_apps themes; do
         target="$HTML_PERSIST/$item"
-        # If the in-image path is a real (non-symlink) directory the
-        # upstream image shipped with content, seed the persistent
-        # copy from it once so we don't lose image-provided defaults
-        # (e.g. the stock themes/ example).  version.php is handled as
-        # a file — it normally doesn't exist in a fresh volume, so the
-        # seed is skipped and the entrypoint's rsync creates it later
-        # (through the symlink) into persistent storage.
-        if [[ ! -e "$target" && -e "$HTML_DIR/$item" && ! -L "$HTML_DIR/$item" ]]; then
-            log "seeding persistent $item from image"
-            cp -a "$HTML_DIR/$item" "$target"
+        src="$IMAGE_SRC/$item"
+        if [[ ! -e "$target" ]]; then
+            if [[ -d "$src" ]]; then
+                log "seeding persistent $item from image ($src)"
+                cp -a "$src" "$target"
+            else
+                log "seeding persistent $item as empty dir (no $src)"
+                mkdir -p "$target"
+            fi
         fi
-        # Ensure the persistent target exists for the directory items
-        # so the symlink resolves to a real (possibly empty) dir the
-        # entrypoint can populate.  version.php is a file: leave it
-        # absent on first boot so the install-detection sees an
-        # uninstalled instance.
-        if [[ "$item" != "version.php" && ! -e "$target" ]]; then
-            mkdir -p "$target"
-        fi
-        # Replace the in-image path with a symlink to persistent
-        # storage.  Remove whatever the volume currently has there
-        # first (an empty dir on a fresh volume, or a stale symlink
-        # from a prior boot of THIS same container filesystem).
         if [[ -L "$HTML_DIR/$item" ]]; then
-            # Already a symlink — re-point it defensively in case the
-            # target path changed between image versions.
             rm -f "$HTML_DIR/$item"
         elif [[ -e "$HTML_DIR/$item" ]]; then
             rm -rf "$HTML_DIR/$item"
         fi
         ln -s "$target" "$HTML_DIR/$item"
     done
-    # The persistent tree must be writable by www-data (the uid the
-    # upstream entrypoint and Apache run as).  chown may fail under
-    # rootless podman's uid remapping; tolerate that like the rest of
-    # start.sh.
+
+    mkdir -p "$PERSIST_DATA_DIR"
+
+    # version.php: the entrypoint reads /var/www/html/version.php to
+    # decide install-vs-upgrade.  It is EXCLUDED from the reseed rsync
+    # (see /upgrade.exclude), so a symlink here is safe — the
+    # entrypoint won't clobber it.  On first boot the persistent file
+    # is absent, so the symlink dangles and install-detection treats
+    # the instance as uninstalled → maintenance:install runs.  The
+    # subsequent ``rsync --include '/version.php'`` writes through the
+    # symlink into app_data; on later boots the persistent file exists
+    # so the entrypoint takes its upgrade path.
+    if [[ -e "$HTML_DIR/version.php" || -L "$HTML_DIR/version.php" ]]; then
+        rm -f "$HTML_DIR/version.php"
+    fi
+    ln -s "$HTML_PERSIST/version.php" "$HTML_DIR/version.php"
+
     chown -R www-data:www-data "$HTML_PERSIST" 2>/dev/null || true
 }
 mkdir -p "$HTML_PERSIST"
@@ -542,6 +562,14 @@ export REDIS_HOST="127.0.0.1"
 export REDIS_HOST_PORT="6379"
 export NEXTCLOUD_ADMIN_USER="${NEXTCLOUD_ADMIN_USER:-admin}"
 export NEXTCLOUD_ADMIN_PASSWORD
+# Persist user data in app_data (NOT the ephemeral /var/www/html
+# volume).  The upstream entrypoint passes this to
+# ``occ maintenance:install --data-dir`` on first boot and, once
+# config.php records ``datadirectory``, Nextcloud keeps using it on
+# every subsequent boot regardless of this env var — but we keep
+# exporting it so a from-scratch reinstall (wiped app_data) lands in
+# the right place too.
+export NEXTCLOUD_DATA_DIR="$PERSIST_DATA_DIR"
 # trusted_domains: the public hostname.  We add 127.0.0.1 too so
 # health-check probes from inside the container don't get rejected.
 export NEXTCLOUD_TRUSTED_DOMAINS="$DOMAIN 127.0.0.1 localhost"
