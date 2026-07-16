@@ -3,16 +3,25 @@
 Sits between the OpenHost router and Apache+Nextcloud.  Two distinct rails:
 
 1. Web UI (browser) — every request that ISN'T on a known native-sync
-   client path is treated as "owner web request": we verify the
-   ``zone_auth`` JWT cookie (RS256 signed by the OpenHost router,
-   key set published at /.well-known/jwks.json).  If the claim
-   ``sub == "owner"`` we strip any client-supplied
-   ``X-Openhost-User`` header and stamp our own
-   ``X-Openhost-User: admin`` (or ``$NEXTCLOUD_ADMIN_USER``).
+   client path is treated as "owner web request": we look for the
+   ``X-OpenHost-Is-Owner: true`` header the OpenHost router stamps
+   after it has authenticated the owner's ``session_token`` cookie.
+   The router is the sole authority for that header — it strips any
+   client-supplied ``X-OpenHost-*`` header on the way in before
+   adding its own — so its presence is trustworthy.  When it is set
+   we strip any client-supplied ``X-Openhost-User`` header and stamp
+   our own ``X-Openhost-User: admin`` (or ``$NEXTCLOUD_ADMIN_USER``).
    Nextcloud's ``user_saml`` app, configured in ``environment-variable``
    mode with ``general-uid_mapping=HTTP_X_OPENHOST_USER``, treats that
    header as the authenticated user — auto-creating the account on
    first login.
+
+   NOTE: earlier revisions verified a router-signed ``zone_auth`` JWT
+   cookie against the router's JWKS endpoint.  Current OpenHost does
+   not mint a ``zone_auth`` cookie for apps at all; the trusted
+   ``X-OpenHost-Is-Owner`` header is the only owner signal.  Relying
+   on the (nonexistent) JWT left ``is_owner`` permanently False and
+   broke SSO entirely.
 
 2. Native sync clients (Desktop / Android / iOS / WebDAV CLIs) and a
    handful of anonymous / Basic-Auth endpoints — pair through Login
@@ -35,16 +44,27 @@ Sits between the OpenHost router and Apache+Nextcloud.  Two distinct rails:
    is a summary that may drift.
 
 Why public_paths = ["/"] in openhost.toml then?  Because the OpenHost
-router treats public_paths as "no zone_auth required AND don't strip
-client-supplied X-Openhost-Is-Owner header".  We want the router to
-let ALL requests reach us so we can enforce the two-rail logic in
-this sidecar instead.  See the openhost.toml comments and the README.
+router bounces any request to a NON-public path that isn't
+authenticated as the owner to its own /login page.  Native sync
+clients (WebDAV, OCS, Login Flow v2) and anonymous public shares
+authenticate to Nextcloud directly, not to the OpenHost owner
+session, so if those paths weren't public the router would 302 them
+to /login and they'd never reach Nextcloud.  Declaring the whole app
+public lets ALL requests reach us so we can enforce the two-rail
+logic in this sidecar instead.  The router still authenticates the
+owner and stamps ``X-OpenHost-Is-Owner: true`` on public paths when
+the owner IS signed in — so owner SSO keeps working.  See the
+openhost.toml comments and the README.
 
-We deliberately strip any client-supplied X-Openhost-User AND
-X-OpenHost-Is-Owner headers on EVERY request — including public
-paths — so a hostile request can't inject an identity the JWT
-didn't authorise.  The ``user_saml`` env-variable authenticator
-will only see the value WE stamp.
+The router is the sole authority for the ``X-OpenHost-*`` headers:
+it strips any client-supplied ``X-OpenHost-*`` header on EVERY
+request before adding its own, so we can trust
+``X-OpenHost-Is-Owner`` when it arrives.  We nevertheless ALSO strip
+any inbound ``X-Openhost-User`` and ``X-OpenHost-Is-Owner`` before
+forwarding upstream to Apache (defence in depth against a
+misconfigured router), and the ``user_saml`` env-variable
+authenticator only ever sees the ``X-Openhost-User`` value WE
+stamp.
 
 Streaming:  Nextcloud serves and accepts files of arbitrary size,
 so unlike miniflux's auth-proxy we MUST stream bodies in both
@@ -62,13 +82,8 @@ import os
 import re
 import socket
 import sys
-import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import AbstractSet, Iterable
-
-import jwt
-import requests
 
 # HTTP header names are case-insensitive on the wire (RFC 9110
 # §5.1), so the casing we choose only matters for our own logs and
@@ -78,9 +93,6 @@ import requests
 # server-variable name); both representations match these constants.
 AUTH_HEADER_NAME = "X-OpenHost-User"
 OWNER_HEADER_NAME = "X-OpenHost-Is-Owner"
-ZONE_COOKIE = "zone_auth"
-JWKS_PATH = "/.well-known/jwks.json"
-JWKS_REFRESH_INTERVAL_SEC = 600  # 10 minutes
 # Maximum number of bytes to copy in a single chunk between client and
 # upstream.  64 KiB is comfortably below typical socket buffer sizes
 # and small enough that an idle connection releases its slot reasonably
@@ -180,172 +192,25 @@ logging.basicConfig(
 log = logging.getLogger("auth_proxy")
 
 
-class JwksCache:
-    """Fetches the OpenHost router's JWKS and caches it with stale fallback.
+def _header_is_owner(value: str | None) -> bool:
+    """Return True if the router marked this request as the owner's.
 
-    On a successful fetch, keys are cached for JWKS_REFRESH_INTERVAL_SEC.
-    On a failed refresh we keep serving the previously-cached keys
-    rather than failing closed, so a transient router blip doesn't
-    lock the owner out of their own files.
+    The OpenHost router authenticates the owner via their
+    ``session_token`` cookie and, on success, stamps
+    ``X-OpenHost-Is-Owner: true`` on the upstream request.  It strips
+    any client-supplied ``X-OpenHost-*`` header before adding its own
+    (see the router's ``_sanitize_forwarded_headers``), so this header
+    cannot be spoofed by a browser or a hostile app request — its
+    presence here is authoritative.
+
+    We compare case-insensitively and tolerate surrounding whitespace
+    because header values are otherwise opaque; the router emits the
+    literal lowercase ``true``.
     """
-
-    def __init__(self, router_url: str) -> None:
-        self._router_url = router_url.rstrip("/")
-        self._keys: list = []
-        self._fetched_at: float = 0.0
-        self._cache_lock = threading.Lock()
-        self._fetch_lock = threading.Lock()
-
-    def _fetch(self) -> list:
-        url = f"{self._router_url}{JWKS_PATH}"
-        with requests.get(url, timeout=5) as resp:
-            resp.raise_for_status()
-            jwks = resp.json()
-        keys = []
-        skipped = 0
-        for jwk in jwks.get("keys", []):
-            try:
-                key = jwt.algorithms.RSAAlgorithm.from_jwk(jwk)
-            except Exception as exc:  # noqa: BLE001
-                skipped += 1
-                kid = jwk.get("kid") if isinstance(jwk, dict) else None
-                log.warning("skipping malformed JWK (kid=%s): %s", kid, exc)
-                continue
-            keys.append(key)
-        if not keys:
-            raise RuntimeError(
-                f"router JWKS contains no usable keys (skipped {skipped})"
-            )
-        return keys
-
-    def get(self) -> list:
-        with self._cache_lock:
-            cached_keys = self._keys
-            cached_at = self._fetched_at
-        if cached_keys and (time.time() - cached_at) < JWKS_REFRESH_INTERVAL_SEC:
-            return cached_keys
-
-        with self._fetch_lock:
-            with self._cache_lock:
-                cached_keys = self._keys
-                cached_at = self._fetched_at
-            if cached_keys and (time.time() - cached_at) < JWKS_REFRESH_INTERVAL_SEC:
-                return cached_keys
-
-            try:
-                keys = self._fetch()
-            except Exception as exc:  # noqa: BLE001 - log+fallback
-                if cached_keys:
-                    log.warning(
-                        "JWKS refresh failed, using cached keys: %s", exc
-                    )
-                    return cached_keys
-                log.warning("JWKS fetch failed and no cache: %s", exc)
-                raise
-
-            # Update both fields under the cache lock.  All readers
-            # of ``_keys`` and ``_fetched_at`` also acquire
-            # ``_cache_lock`` (see ``get`` and the early-return at
-            # the top of ``_fetch_lock``), so they observe the two
-            # writes as a single atomic update — no torn reads.
-            now = time.time()
-            with self._cache_lock:
-                self._fetched_at = now
-                self._keys = keys
-            log.info("refreshed JWKS (%d key(s))", len(keys))
-            return keys
-
-    def prefetch(self) -> None:
-        try:
-            self.get()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("initial JWKS prefetch failed (will retry on demand): %s", exc)
-
-
-def _parse_cookie_header(cookie_header: str | None) -> dict[str, str]:
-    """Parse an RFC6265 Cookie header into {name: value} (first-wins).
-
-    Browsers send most-specific-path / most-specific-domain cookies
-    first, so the first occurrence is what the site "meant" to set.
-    Also prevents a hostile client from appending a duplicate
-    ``zone_auth=garbage`` to invalidate an otherwise valid token.
-    """
-    if not cookie_header:
-        return {}
-    result: dict[str, str] = {}
-    for part in cookie_header.split(";"):
-        if "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        result.setdefault(name.strip(), value.strip())
-    return result
-
-
-def _verify_owner(token: str, jwks: JwksCache) -> bool:
-    """Return True if the JWT is a valid router-signed owner token."""
-    if not token:
+    if value is None:
         return False
-    try:
-        keys = jwks.get()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("JWKS unavailable; denying owner check: %s", exc)
-        return False
-    last_error: jwt.PyJWTError | None = None
-    # Sentinel ``False`` distinguishes "we never managed to decode the
-    # JWT against any key" from "we decoded successfully, but the sub
-    # was not 'owner'".  Without the sentinel, ``sub=None`` (a valid
-    # JWT with no sub claim) would log nothing at any level.
-    decode_succeeded = False
-    last_sub: str | None = None
-    for key in keys:
-        try:
-            claims = jwt.decode(
-                token,
-                key,
-                algorithms=["RS256"],
-                options={
-                    "require": ["exp"],
-                    "verify_aud": False,
-                },
-            )
-        except jwt.PyJWTError as exc:
-            # Capture for diagnostic logging if every key fails.  We
-            # still have to try every key because a JWKS rotation
-            # window can have a token signed under the previous key
-            # while the new key is also published.
-            last_error = exc
-            continue
-        decode_succeeded = True
-        if claims.get("sub") == "owner":
-            return True
-        # Cryptographically valid token, but the claim isn't
-        # ``owner`` — record the actual subject for diagnostic
-        # logging.  We continue to the next key in case the JWKS
-        # rotation window has multiple valid keys, but the very
-        # first key that decoded successfully will already have
-        # told us the right answer (sub doesn't change with key
-        # rotation), so this loop will terminate quickly in
-        # practice.
-        last_sub = claims.get("sub")
-    # Log at DEBUG (not INFO/WARNING) because failed JWT
-    # verifications are common and noisy: any anonymous request
-    # without zone_auth, an expired session, or a third-party
-    # request reaches this path.  Operators investigating "why
-    # can't I log in?" can crank AUTH_PROXY_LOG_LEVEL=DEBUG to
-    # see the per-token failure type (ExpiredSignatureError,
-    # InvalidSignatureError, MissingRequiredClaimError, or
-    # "valid token but sub=X != owner").
-    if decode_succeeded:
-        log.debug(
-            "JWT verified but sub=%r != 'owner'; denying owner check",
-            last_sub,
-        )
-    elif last_error is not None:
-        log.debug(
-            "JWT verification failed against all %d JWKS key(s): %s: %s",
-            len(keys), type(last_error).__name__, last_error,
-        )
-    return False
+    return value.strip().lower() == "true"
+
 
 
 def _strip_headers(
@@ -428,7 +293,6 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     close_connection = True
 
     # Class-level configuration set by main() before serve_forever().
-    jwks: JwksCache | None = None
     upstream_host: str = "127.0.0.1"
     upstream_port: int = 8081
     admin_user: str = "admin"
@@ -516,14 +380,6 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         except OSError as exc:
             log.debug("settimeout on client socket failed: %s", exc)
 
-        # Ensure the JWKS cache is available before we make policy
-        # decisions.  This is set in main() before the server starts;
-        # a None here implies a construction-order bug.
-        if self.jwks is None:
-            log.error("auth-proxy JWKS not initialised; refusing request")
-            self._safe_send_error(503, "auth-proxy not initialised")
-            return
-
         # Decide if this path should bypass SSO.  Public paths get
         # forwarded with the ORIGINAL Authorization header preserved
         # (Basic Auth from sync clients) and with NO X-Openhost-User
@@ -533,11 +389,26 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         # For protected paths, decide owner status.  We always strip
         # client-supplied auth headers so a hostile request can't
         # inject identity even on a bypassed path.
+        #
+        # Owner status comes from the ``X-OpenHost-Is-Owner`` header
+        # the OpenHost router stamps on the request AFTER it has
+        # authenticated the owner's ``session_token`` cookie.  The
+        # router is the sole authority for this header: it strips any
+        # client-supplied ``X-OpenHost-*`` header on the way in (see
+        # the router's ``_sanitize_forwarded_headers``) before adding
+        # its own, so a value of ``true`` here is trustworthy.  We
+        # read it BEFORE the ``_strip_headers`` call below removes it
+        # from the set we forward to Apache.
+        #
+        # Historically this proxy verified a router-signed ``zone_auth``
+        # JWT cookie against the router's JWKS.  That path is dead on
+        # current OpenHost: the router never mints a ``zone_auth``
+        # cookie — owner auth is entirely session-cookie + trusted
+        # header.  Relying on the (nonexistent) JWT meant ``is_owner``
+        # was always False and SSO never engaged.  See README.
         is_owner = False
         if not public:
-            cookies = _parse_cookie_header(self.headers.get("Cookie"))
-            token = cookies.get(ZONE_COOKIE, "")
-            is_owner = _verify_owner(token, self.jwks)
+            is_owner = _header_is_owner(self.headers.get(OWNER_HEADER_NAME))
 
         # Headers we must always strip before forwarding upstream.
         # ``X-Openhost-User`` and ``X-OpenHost-Is-Owner`` are the
@@ -552,9 +423,9 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         )
 
         # Stamp the SSO header only on protected paths AND only when
-        # we successfully verified an owner JWT.  Public paths reach
-        # Nextcloud with no SSO header; user_saml's env-var auth then
-        # leaves them alone and the request falls through to
+        # the router told us the visitor is the owner.  Public paths
+        # reach Nextcloud with no SSO header; user_saml's env-var auth
+        # then leaves them alone and the request falls through to
         # Nextcloud's regular Basic Auth handling.
         if not public and is_owner:
             cleaned_headers.append((AUTH_HEADER_NAME, self.admin_user))
@@ -1301,11 +1172,6 @@ def _port_from_env(name: str, default: int) -> int:
 
 
 def main() -> int:
-    router_url = os.environ.get("OPENHOST_ROUTER_URL", "").strip()
-    if not router_url:
-        log.error("OPENHOST_ROUTER_URL is not set; refusing to start")
-        return 1
-
     try:
         listen_port = _port_from_env("AUTH_PROXY_LISTEN_PORT", 8080)
         upstream_port = _port_from_env("APACHE_PORT", 8081)
@@ -1315,10 +1181,6 @@ def main() -> int:
 
     admin_user = os.environ.get("NEXTCLOUD_ADMIN_USER", "admin").strip() or "admin"
 
-    jwks = JwksCache(router_url)
-    jwks.prefetch()
-
-    AuthProxyHandler.jwks = jwks
     AuthProxyHandler.upstream_port = upstream_port
     AuthProxyHandler.admin_user = admin_user
 
@@ -1332,10 +1194,9 @@ def main() -> int:
         )
         return 1
     log.info(
-        "listening on 0.0.0.0:%d -> 127.0.0.1:%d (router=%s, admin_user=%s)",
+        "listening on 0.0.0.0:%d -> 127.0.0.1:%d (admin_user=%s)",
         listen_port,
         upstream_port,
-        router_url,
         admin_user,
     )
     try:

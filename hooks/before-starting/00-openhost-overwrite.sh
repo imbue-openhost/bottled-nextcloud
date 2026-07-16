@@ -206,10 +206,60 @@ if isinstance(data, dict) and data:
         log "warning: could not discover user_saml config slot; defaulting to 1"
         SAML_SLOT="1"
     fi
-    occ_or_warn "saml:config:set user_saml[$SAML_SLOT] general-uid_mapping" \
-        saml:config:set --general-uid_mapping "HTTP_X_OPENHOST_USER" "$SAML_SLOT"
+
+    # user_saml >= 8 (ConfigurationsMapper::set) REJECTS a
+    # ``general-uid_mapping`` value that starts with ``HTTP_`` while
+    # ``type == environment-variable`` — it throws
+    # "Environment var starting with HTTP_ are not allowed...".  The
+    # post-installation hook sidesteps this by setting the mapping
+    # BEFORE flipping type to environment-variable.  On a re-stamp,
+    # though, type is already environment-variable, so a naive
+    # ``saml:config:set --general-uid_mapping HTTP_X_OPENHOST_USER``
+    # fails every boot and (worse) can never repair genuine drift.
+    #
+    # Only re-stamp when the current mapping actually differs from the
+    # desired value — the common case (no drift) then issues no
+    # blocked command at all.  When we DO need to write it, briefly
+    # unset the app-wide ``type`` so the mapper's guard doesn't fire,
+    # write the mapping, then restore ``type``.  The window is a few
+    # milliseconds and runs before Apache binds its port, so no
+    # request observes the transient state.
+    DESIRED_UID_MAPPING="HTTP_X_OPENHOST_USER"
+    CURRENT_UID_MAPPING=$(printf '%s' "$SAML_SLOT_OUT" | SAML_SLOT="$SAML_SLOT" python3 -c '
+import json, os, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+slot = os.environ.get("SAML_SLOT", "")
+if isinstance(data, dict):
+    cfg = data.get(slot) or {}
+    if isinstance(cfg, dict):
+        v = cfg.get("general-uid_mapping")
+        if isinstance(v, str):
+            print(v)
+' 2>/dev/null || true)
+
+    if [[ "$CURRENT_UID_MAPPING" == "$DESIRED_UID_MAPPING" ]]; then
+        log "user_saml[$SAML_SLOT] general-uid_mapping already correct; not re-stamping"
+    else
+        log "user_saml[$SAML_SLOT] general-uid_mapping is '$CURRENT_UID_MAPPING'; re-stamping to '$DESIRED_UID_MAPPING'"
+        # Temporarily clear the type guard so the HTTP_-prefixed value
+        # is accepted, then restore it.  If clearing fails we still
+        # attempt the set (it will just warn), and we always restore
+        # type at the end regardless.
+        occ_or_warn "config:app:delete user_saml type (transient)" \
+            config:app:delete user_saml type
+        occ_or_warn "saml:config:set user_saml[$SAML_SLOT] general-uid_mapping" \
+            saml:config:set --general-uid_mapping "$DESIRED_UID_MAPPING" "$SAML_SLOT"
+    fi
+
     # ``type`` is an app-wide config value (not a per-provider one);
-    # see the post-installation hook for context.
+    # see the post-installation hook for context.  We (re-)assert it
+    # unconditionally — this is both the normal per-boot re-affirm and
+    # the restore step for the transient-unset path above.  It never
+    # trips the mapper guard because that guard only applies to
+    # ``saml:config:set``, not to ``config:app:set``.
     occ_or_warn "config:app:set user_saml type=environment-variable" \
         config:app:set user_saml type --value="environment-variable"
 elif [[ -z "$APP_LIST" ]]; then
