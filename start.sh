@@ -43,11 +43,35 @@ set -euo pipefail
 log() { printf '[start.sh] %s\n' "$*" >&2; }
 
 DATA_DIR="${OPENHOST_APP_DATA_DIR:-/var/lib/openhost-nextcloud}"
-TMP_DIR="${OPENHOST_APP_TEMP_DATA_DIR:-/tmp/openhost-nextcloud}"
+# OpenHost exposes the per-boot scratch mount as OPENHOST_APP_TEMP_DIR.
+# (An earlier revision read OPENHOST_APP_TEMP_DATA_DIR, which OpenHost
+# never sets — so TMP_DIR always fell back to a non-persistent /tmp
+# path.  Accept both names for backwards compatibility, preferring the
+# one OpenHost actually provides.)
+TMP_DIR="${OPENHOST_APP_TEMP_DIR:-${OPENHOST_APP_TEMP_DATA_DIR:-/tmp/openhost-nextcloud}}"
 PG_DATA="$DATA_DIR/pgdata"
 REDIS_DIR="$DATA_DIR/redis"
 PG_PASSWORD_FILE="$DATA_DIR/.postgres_password"
 ADMIN_PASSWORD_FILE="$DATA_DIR/admin_password.txt"
+# Nextcloud keeps its whole application tree (core code, installed
+# apps, the config/ dir with config.php, and — by default — the data/
+# uploads dir) under /var/www/html.  The upstream image declares that
+# path as an anonymous VOLUME, but OpenHost does NOT persist
+# container volumes across rebuilds: every ``update`` reload gives the
+# container a fresh empty /var/www/html.  With an empty tree the
+# upstream entrypoint sees no version.php, decides the instance is
+# uninstalled, and runs ``maintenance:install`` again — which then
+# collides with the STILL-persistent Postgres database
+# ("The Login is already being used") and wedges the container in a
+# retry loop.
+#
+# We therefore relocate the entire tree onto the persistent app_data
+# mount and expose it at /var/www/html via a bind mount, so config.php
+# and version.php survive rebuilds and the upstream entrypoint takes
+# its ``upgrade`` path instead of ``install``.  HTML_PERSIST holds the
+# real files; see relocate_html_tree below.
+HTML_DIR="/var/www/html"
+HTML_PERSIST="$DATA_DIR/html"
 
 mkdir -p "$DATA_DIR" "$TMP_DIR" "$REDIS_DIR" /run/postgresql /run/redis
 chown postgres:postgres /run/postgresql 2>/dev/null || true
@@ -76,6 +100,80 @@ resolve_domain() {
 DOMAIN="$(resolve_domain)"
 log "DOMAIN=$DOMAIN"
 log "DATA_DIR=$DATA_DIR"
+
+# ---------------------------------------------------------------------
+# Persist Nextcloud's state across container rebuilds.
+#
+# /var/www/html is an ephemeral podman volume under OpenHost.  We keep
+# the pieces of Nextcloud state that MUST survive a rebuild on the
+# persistent app_data mount and expose them back at their expected
+# paths via symlinks:
+#
+#   * config/        — holds config.php (DB creds, instanceid, secret,
+#                      trusted_domains, the user_saml settings, ...).
+#   * data/          — user uploads + nextcloud.log + the file cache.
+#   * custom_apps/    — apps installed after image build.
+#   * themes/        — custom themes.
+#   * version.php    — the upstream entrypoint reads this to decide
+#                      install-vs-upgrade; persisting it is what makes
+#                      a rebuild take the ``upgrade`` path instead of
+#                      re-running ``maintenance:install`` against the
+#                      already-populated Postgres database.
+#
+# The upstream entrypoint's rsync only (re)seeds config/data/custom_apps/
+# themes when the target is an EMPTY directory (``directory_empty``).
+# A symlink pointing at an already-populated persistent dir is not
+# empty, so subsequent boots leave it untouched; on first boot the
+# targets are empty and the entrypoint populates them (writing through
+# the symlinks into persistent storage).
+#
+# We do NOT symlink the whole tree: the bulk of /var/www/html is
+# immutable image code that should track the image, and a bind mount
+# (the obvious whole-tree alternative) is denied under rootless podman.
+relocate_html_state() {
+    local item target
+    for item in config data custom_apps themes version.php; do
+        target="$HTML_PERSIST/$item"
+        # If the in-image path is a real (non-symlink) directory the
+        # upstream image shipped with content, seed the persistent
+        # copy from it once so we don't lose image-provided defaults
+        # (e.g. the stock themes/ example).  version.php is handled as
+        # a file — it normally doesn't exist in a fresh volume, so the
+        # seed is skipped and the entrypoint's rsync creates it later
+        # (through the symlink) into persistent storage.
+        if [[ ! -e "$target" && -e "$HTML_DIR/$item" && ! -L "$HTML_DIR/$item" ]]; then
+            log "seeding persistent $item from image"
+            cp -a "$HTML_DIR/$item" "$target"
+        fi
+        # Ensure the persistent target exists for the directory items
+        # so the symlink resolves to a real (possibly empty) dir the
+        # entrypoint can populate.  version.php is a file: leave it
+        # absent on first boot so the install-detection sees an
+        # uninstalled instance.
+        if [[ "$item" != "version.php" && ! -e "$target" ]]; then
+            mkdir -p "$target"
+        fi
+        # Replace the in-image path with a symlink to persistent
+        # storage.  Remove whatever the volume currently has there
+        # first (an empty dir on a fresh volume, or a stale symlink
+        # from a prior boot of THIS same container filesystem).
+        if [[ -L "$HTML_DIR/$item" ]]; then
+            # Already a symlink — re-point it defensively in case the
+            # target path changed between image versions.
+            rm -f "$HTML_DIR/$item"
+        elif [[ -e "$HTML_DIR/$item" ]]; then
+            rm -rf "$HTML_DIR/$item"
+        fi
+        ln -s "$target" "$HTML_DIR/$item"
+    done
+    # The persistent tree must be writable by www-data (the uid the
+    # upstream entrypoint and Apache run as).  chown may fail under
+    # rootless podman's uid remapping; tolerate that like the rest of
+    # start.sh.
+    chown -R www-data:www-data "$HTML_PERSIST" 2>/dev/null || true
+}
+mkdir -p "$HTML_PERSIST"
+relocate_html_state
 
 # ---------------------------------------------------------------------
 # Generate / load the postgres password.  We keep it in a side file
