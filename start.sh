@@ -424,6 +424,16 @@ cleanup() {
     fi
     TERMINATING=1
     log "tearing down"
+    # Capture any state written since this boot's post-Apache copy-out
+    # (e.g. an extension the operator installed from the web UI, or a
+    # config.php change) so it survives the rebuild.  Guarded on
+    # index.php so we never copy out a half-populated volume, and
+    # ``|| true`` so a copy failure never blocks teardown.  Runs before
+    # we stop Apache/Postgres so the on-disk files are quiescent copies
+    # of what the running instance was using.
+    if [[ -f "$HTML_DIR/index.php" ]]; then
+        persist_html_state_out || true
+    fi
     kill -TERM ${APACHE_PID:-} ${PROXY_PID:-} ${REDIS_PID:-} \
               ${PG_WATCHDOG_PID:-} 2>/dev/null || true
     # Postgres is not a direct child; stop it via pg_ctl.
