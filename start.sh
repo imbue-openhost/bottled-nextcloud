@@ -106,94 +106,91 @@ log "DATA_DIR=$DATA_DIR"
 #
 # /var/www/html is an ephemeral podman volume under OpenHost.  We keep
 # the pieces of Nextcloud state that MUST survive a rebuild on the
-# persistent app_data mount and expose them back at their expected
-# paths via symlinks:
+# persistent app_data mount:
 #
-#   * config/        — holds config.php (DB creds, instanceid, secret,
-#                      trusted_domains, the user_saml settings, ...).
-#   * data/          — user uploads + nextcloud.log + the file cache.
-#   * custom_apps/    — apps installed after image build.
-#   * themes/        — custom themes.
-#   * version.php    — the upstream entrypoint reads this to decide
-#                      install-vs-upgrade; persisting it is what makes
-#                      a rebuild take the ``upgrade`` path instead of
-#                      re-running ``maintenance:install`` against the
-#                      already-populated Postgres database.
+#   * config/config.php — DB creds, instanceid, secret, trusted_domains,
+#                         the user_saml settings, ...  Without it a
+#                         rebuild re-runs ``maintenance:install`` and
+#                         collides with the persistent Postgres DB
+#                         ("The Login is already being used").
+#   * version.php       — the upstream entrypoint reads this to decide
+#                         install-vs-upgrade; persisting it makes a
+#                         rebuild take the ``upgrade`` path.
+#   * custom_apps/      — apps installed after image build.
+#   * themes/           — custom themes.
+#   * data/             — user uploads + nextcloud.log + file cache;
+#                         handled separately via NEXTCLOUD_DATA_DIR
+#                         (see the env block below), which the upstream
+#                         install writes directly into app_data.
 #
-# Why seed from /usr/src/nextcloud, not from the volume's own copy:
-# the upstream entrypoint reseeds config/data/custom_apps/themes from
-# /usr/src/nextcloud ONLY when the target directory is EMPTY
-# (``directory_empty`` in /entrypoint.sh) — and when it does, its
-# rsync REPLACES our symlink with a real directory, silently breaking
-# persistence (the symptom that bit an earlier revision: config.php
-# landed in the ephemeral volume, not app_data, so it vanished on the
-# next rebuild).  By seeding the persistent target from the image's
-# own /usr/src/nextcloud/<item> the symlink is never empty, so the
-# entrypoint skips its reseed rsync and leaves the symlink intact.
-# The install/upgrade then writes config.php + version.php THROUGH the
-# symlink into app_data, where they survive rebuilds.
-#
-# We do NOT symlink the whole tree: the bulk of /var/www/html is
-# immutable image code that should track the image, and a bind mount
-# (the obvious whole-tree alternative) is denied under rootless podman.
-IMAGE_SRC="/usr/src/nextcloud"
-# The Nextcloud user data dir lives entirely in app_data and is passed
-# to the upstream install via NEXTCLOUD_DATA_DIR (see the env block
-# below).  The entrypoint never rsyncs into an external data dir, so
-# no symlink games are needed for it — it just works.
+# We use a COPY-IN / COPY-OUT scheme rather than symlinks.  Symlinks
+# do not survive the upstream entrypoint: its top-level
+# ``rsync --delete --exclude-from=/upgrade.exclude`` removes a
+# destination ``config`` symlink (the ``/config/`` exclude protects
+# the contents from transfer but not the symlink from --delete), and
+# its ``rsync --include /version.php`` replaces a dangling
+# version.php symlink with a real file.  Both were verified
+# empirically.  Copy-in before the entrypoint runs, copy-out after
+# it has settled (persist_html_state_out, called once Apache is up).
 PERSIST_DATA_DIR="$HTML_PERSIST/data"
+PERSIST_DIRS=(custom_apps themes)
 
-relocate_html_state() {
-    local item target src
-    # config/, custom_apps/ and themes/ are symlinked into app_data.
-    # We seed each persistent target ONCE from the IMAGE source
-    # (/usr/src/nextcloud/<item>), NOT from the ephemeral volume copy,
-    # so the target is non-empty.  A non-empty target makes the
-    # entrypoint's ``directory_empty`` check false, so it skips the
-    # reseed rsync that would otherwise REPLACE our symlink with a
-    # real directory (the bug that broke persistence before).  The
-    # install/upgrade then writes config.php THROUGH the symlink into
-    # app_data.
-    for item in config custom_apps themes; do
-        target="$HTML_PERSIST/$item"
-        src="$IMAGE_SRC/$item"
-        if [[ ! -e "$target" ]]; then
-            if [[ -d "$src" ]]; then
-                log "seeding persistent $item from image ($src)"
-                cp -a "$src" "$target"
-            else
-                log "seeding persistent $item as empty dir (no $src)"
-                mkdir -p "$target"
-            fi
-        fi
-        if [[ -L "$HTML_DIR/$item" ]]; then
-            rm -f "$HTML_DIR/$item"
-        elif [[ -e "$HTML_DIR/$item" ]]; then
-            rm -rf "$HTML_DIR/$item"
-        fi
-        ln -s "$target" "$HTML_DIR/$item"
-    done
-
-    mkdir -p "$PERSIST_DATA_DIR"
-
-    # version.php: the entrypoint reads /var/www/html/version.php to
-    # decide install-vs-upgrade.  It is EXCLUDED from the reseed rsync
-    # (see /upgrade.exclude), so a symlink here is safe — the
-    # entrypoint won't clobber it.  On first boot the persistent file
-    # is absent, so the symlink dangles and install-detection treats
-    # the instance as uninstalled → maintenance:install runs.  The
-    # subsequent ``rsync --include '/version.php'`` writes through the
-    # symlink into app_data; on later boots the persistent file exists
-    # so the entrypoint takes its upgrade path.
-    if [[ -e "$HTML_DIR/version.php" || -L "$HTML_DIR/version.php" ]]; then
-        rm -f "$HTML_DIR/version.php"
+# Copy persistent state INTO the fresh volume before the upstream
+# entrypoint runs, so it sees an existing install (version.php +
+# config.php present) and takes the upgrade path instead of
+# reinstalling.
+persist_html_state_in() {
+    mkdir -p "$HTML_PERSIST" "$PERSIST_DATA_DIR"
+    if [[ -f "$HTML_PERSIST/config.php" ]]; then
+        log "restoring persisted config.php into volume"
+        mkdir -p "$HTML_DIR/config"
+        cp -a "$HTML_PERSIST/config.php" "$HTML_DIR/config/config.php"
     fi
-    ln -s "$HTML_PERSIST/version.php" "$HTML_DIR/version.php"
+    if [[ -f "$HTML_PERSIST/version.php" ]]; then
+        log "restoring persisted version.php into volume"
+        cp -a "$HTML_PERSIST/version.php" "$HTML_DIR/version.php"
+    fi
+    local d
+    for d in "${PERSIST_DIRS[@]}"; do
+        if [[ -d "$HTML_PERSIST/$d" ]] && [[ -n "$(ls -A "$HTML_PERSIST/$d" 2>/dev/null)" ]]; then
+            log "restoring persisted $d into volume"
+            mkdir -p "$HTML_DIR/$d"
+            cp -a "$HTML_PERSIST/$d/." "$HTML_DIR/$d/"
+        fi
+    done
+    chown -R www-data:www-data "$HTML_DIR/config" "$HTML_DIR/version.php" 2>/dev/null || true
+}
 
+# Copy state BACK OUT to persistent storage after the entrypoint has
+# installed/upgraded.  Called once Apache is confirmed listening, so
+# config.php (written by maintenance:install) and the current
+# version.php exist.  Idempotent: safe to run on every boot.
+persist_html_state_out() {
+    if [[ -f "$HTML_DIR/config/config.php" ]]; then
+        cp -a "$HTML_DIR/config/config.php" "$HTML_PERSIST/config.php.partial" \
+            && mv "$HTML_PERSIST/config.php.partial" "$HTML_PERSIST/config.php" \
+            && log "persisted config.php to app_data" \
+            || log "warning: failed to persist config.php"
+    fi
+    if [[ -f "$HTML_DIR/version.php" ]]; then
+        cp -a "$HTML_DIR/version.php" "$HTML_PERSIST/version.php.partial" \
+            && mv "$HTML_PERSIST/version.php.partial" "$HTML_PERSIST/version.php" \
+            && log "persisted version.php to app_data" \
+            || log "warning: failed to persist version.php"
+    fi
+    local d
+    for d in "${PERSIST_DIRS[@]}"; do
+        if [[ -d "$HTML_DIR/$d" ]] && [[ -n "$(ls -A "$HTML_DIR/$d" 2>/dev/null)" ]]; then
+            mkdir -p "$HTML_PERSIST/$d"
+            cp -a "$HTML_DIR/$d/." "$HTML_PERSIST/$d/" 2>/dev/null \
+                && log "persisted $d to app_data" \
+                || log "warning: failed to persist $d"
+        fi
+    done
     chown -R www-data:www-data "$HTML_PERSIST" 2>/dev/null || true
 }
 mkdir -p "$HTML_PERSIST"
-relocate_html_state
+persist_html_state_in
 
 # ---------------------------------------------------------------------
 # Generate / load the postgres password.  We keep it in a side file
@@ -640,6 +637,13 @@ if [[ "$apache_ready" != "1" ]]; then
     wait "$APACHE_PID" || true
     exit 1
 fi
+
+# Apache is up, which means the upstream entrypoint has finished its
+# install/upgrade and written config.php + version.php.  Copy that
+# state back out to app_data so the next rebuild restores it.  This
+# is the second half of the copy-in / copy-out persistence scheme
+# (see persist_html_state_in at the top of this script).
+persist_html_state_out
 
 log "starting auth-proxy on :${AUTH_PROXY_LISTEN_PORT:-8080}"
 python3 /usr/local/bin/auth_proxy.py &
