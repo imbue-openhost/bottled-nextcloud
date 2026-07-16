@@ -141,6 +141,15 @@ PERSIST_DIRS=(custom_apps themes)
 # reinstalling.
 persist_html_state_in() {
     mkdir -p "$HTML_PERSIST" "$PERSIST_DATA_DIR"
+    # The app_data mount is created owned by the container's root
+    # (uid 0), but the upstream install and Apache run as www-data
+    # (uid 33) and must be able to create/write the data dir and the
+    # persisted tree.  chown the whole persistent tree up front.  This
+    # may fail under rootless podman's uid remapping (hence ``|| true``
+    # elsewhere) but on OpenHost the container is root-in-userns so it
+    # succeeds and is required for the install to proceed
+    # ("Cannot create or write into the data directory ...").
+    chown -R www-data:www-data "$HTML_PERSIST" 2>/dev/null || true
     if [[ -f "$HTML_PERSIST/config.php" ]]; then
         log "restoring persisted config.php into volume"
         mkdir -p "$HTML_DIR/config"
