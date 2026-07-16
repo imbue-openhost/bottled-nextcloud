@@ -4,7 +4,8 @@
 # things that would normally be separate containers in a docker-compose
 # deployment: the Nextcloud Apache + PHP stack, PostgreSQL, Redis, and
 # a small Python auth-sidecar that fronts Apache and bridges OpenHost's
-# zone_auth cookie to Nextcloud's user_saml app.
+# owner signal (the router-stamped X-OpenHost-Is-Owner header) to
+# Nextcloud's user_saml app.
 #
 # The Nextcloud upstream image's entrypoint (which handles install,
 # upgrade, and hooks) is preserved verbatim — we just call it from a

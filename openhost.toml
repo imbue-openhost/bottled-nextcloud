@@ -1,7 +1,7 @@
 [app]
 name = "nextcloud"
 version = "0.1.0"
-description = "Nextcloud (files / calendar / contacts) with zone_auth single sign-on"
+description = "Nextcloud (files / calendar / contacts) with OpenHost owner single sign-on"
 authors = ["Andrew Laack <andrew@laack.co>"]
 
 [runtime.container]
@@ -15,10 +15,13 @@ port = 8080
 health_check = "/status.php"
 # Every path is "public" at the router level: the auth-sidecar inside
 # the container handles SSO selectively, leaving WebDAV (/remote.php
-# /dav/...), OCS (/ocs/...), Login Flow v2 (/index.php/login/v2/...)
-# and well-known endpoints reachable without zone_auth so native sync
-# clients can carry their own app-password Basic Auth.  See README's
-# Architecture section for why.
+# /dav/...), OCS (/ocs/...), Login Flow v2 (/index.php/login/v2/...),
+# public file shares (/index.php/s/...) and well-known endpoints
+# reachable without an authenticated owner so native sync clients can
+# carry their own app-password Basic Auth and anonymous visitors can
+# open public share links.  The router still authenticates the owner
+# and stamps the trusted ``X-OpenHost-Is-Owner`` header the sidecar
+# reads for SSO.  See README's Architecture section for why.
 public_paths = ["/"]
 
 [resources]
@@ -30,14 +33,15 @@ memory_mb = 1536
 cpu_millicores = 1500
 
 [data]
-# Persistent: Postgres data, the generated postgres password, the
-# generated bootstrap admin password.  Nextcloud's own data/uploads
-# and config directories live inside the container at
-# ``/var/www/html/{data,config}`` and are persisted by the upstream
-# image's volumes (which OpenHost honours).  The auth-sidecar's JWKS
-# cache is in-memory only — it's refetched from the OpenHost router
-# on every container start, with stale fallback to handle a router
-# restart.
+# Persistent: Postgres data, the generated postgres/admin passwords,
+# and Nextcloud's own state under ``$OPENHOST_APP_DATA_DIR/html``
+# (config.php, version.php, user data/, custom_apps/, themes/).  The
+# upstream image mounts /var/www/html as an anonymous podman VOLUME,
+# which OpenHost does NOT persist across rebuilds, so start.sh keeps
+# that state in app_data and copies it into the fresh volume on each
+# boot (see the README's persistence section).  The auth-sidecar
+# needs no persistent state of its own — owner status comes from the
+# router-stamped ``X-OpenHost-Is-Owner`` header on each request.
 app_data = true
 # Per-boot scratch: Apache logs, Postgres logs, Redis runtime state,
 # socket dirs.  Survives crashes but not redeploys.
