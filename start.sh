@@ -150,6 +150,35 @@ persist_html_state_in() {
     # succeeds and is required for the install to proceed
     # ("Cannot create or write into the data directory ...").
     chown -R www-data:www-data "$HTML_PERSIST" 2>/dev/null || true
+
+    # Populate the Nextcloud CORE CODE into the fresh volume ourselves.
+    #
+    # The upstream entrypoint only rsyncs /usr/src/nextcloud into
+    # /var/www/html when it decides the on-disk version is OLDER than
+    # the image version.  Once we restore a persisted version.php (so a
+    # rebuild takes the upgrade path instead of reinstalling), the
+    # on-disk version EQUALS the image version, so the entrypoint skips
+    # that rsync entirely — leaving a fresh volume with NO index.php or
+    # core code and Apache serving 403.  We therefore seed the code
+    # ourselves whenever the volume is missing it, mirroring the
+    # entrypoint's own rsync but WITHOUT --delete (we must not wipe the
+    # config/version.php we are about to restore) and excluding the
+    # state paths we manage.  ``--ignore-existing`` keeps it cheap on
+    # the (rare) boot where code is already present.
+    if [[ ! -f "$HTML_DIR/index.php" ]]; then
+        log "seeding Nextcloud core code into fresh volume"
+        # Copy everything EXCEPT version.php and data (we manage those).
+        # We DO let the image's config/ defaults (redis.config.php,
+        # reverse-proxy.config.php, apcu.config.php, ...) through — the
+        # persisted config.php is layered on top afterwards.  No
+        # --delete: we must not wipe state we're about to restore.
+        rsync -rlD \
+            --exclude '/data/***' \
+            --exclude '/version.php' \
+            /usr/src/nextcloud/ "$HTML_DIR/" \
+            || log "warning: core code seed rsync returned non-zero"
+        chown -R www-data:www-data "$HTML_DIR" 2>/dev/null || true
+    fi
     if [[ -f "$HTML_PERSIST/config.php" ]]; then
         log "restoring persisted config.php into volume"
         mkdir -p "$HTML_DIR/config"
