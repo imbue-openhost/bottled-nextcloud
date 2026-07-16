@@ -65,11 +65,14 @@ ADMIN_PASSWORD_FILE="$DATA_DIR/admin_password.txt"
 # ("The Login is already being used") and wedges the container in a
 # retry loop.
 #
-# We therefore relocate the entire tree onto the persistent app_data
-# mount and expose it at /var/www/html via a bind mount, so config.php
-# and version.php survive rebuilds and the upstream entrypoint takes
-# its ``upgrade`` path instead of ``install``.  HTML_PERSIST holds the
-# real files; see relocate_html_tree below.
+# We therefore keep the state that must survive a rebuild on the
+# persistent app_data mount (HTML_PERSIST) and, on each boot, copy it
+# INTO the fresh /var/www/html volume before the upstream entrypoint
+# runs and copy it back OUT once Apache is up — so config.php and
+# version.php survive rebuilds and the upstream entrypoint takes its
+# ``upgrade`` path instead of ``install``.  A bind mount would be
+# simpler but is denied under rootless podman.  See
+# persist_html_state_in / persist_html_state_out below.
 HTML_DIR="/var/www/html"
 HTML_PERSIST="$DATA_DIR/html"
 
