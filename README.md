@@ -11,7 +11,12 @@ app, with single sign-on driven by the OpenHost router's
     currently PostgreSQL 17 on Trixie), private to the container,
     listens on 127.0.0.1 only over TCP and unix-socket
   - Redis (currently 8.x on Trixie), private to the container,
-    used for file locking + memory cache
+    reachable ONLY over the unix socket `/run/redis/redis.sock` (TCP
+    disabled). Wired in as Nextcloud's distributed cache AND
+    transactional file-locking backend (`memcache.distributed` +
+    `memcache.locking`); APCu is the local cache (`memcache.local`).
+    Apache/PHP (running as `www-data`) is added to the `redis` group
+    so it can open the 0770 socket.
   - A small Python auth-sidecar in front of Apache that bridges
     OpenHost's owner signal (the `X-OpenHost-Is-Owner` header) to
     Nextcloud's `user_saml` app in environment-variable mode
