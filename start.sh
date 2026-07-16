@@ -163,8 +163,9 @@ persist_html_state_in() {
     # ourselves whenever the volume is missing it, mirroring the
     # entrypoint's own rsync but WITHOUT --delete (we must not wipe the
     # config/version.php we are about to restore) and excluding the
-    # state paths we manage.  ``--ignore-existing`` keeps it cheap on
-    # the (rare) boot where code is already present.
+    # state paths we manage.  The ``! -f index.php`` guard means this
+    # only runs on a fresh/empty volume, so the (rare) boot where code
+    # is already present skips it entirely.
     if [[ ! -f "$HTML_DIR/index.php" ]]; then
         log "seeding Nextcloud core code into fresh volume"
         # Copy everything EXCEPT version.php and data (we manage those).

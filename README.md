@@ -1,7 +1,8 @@
 # openhost-nextcloud
 
 Nextcloud (files / calendar / contacts / etc.) packaged as an OpenHost
-app, with single sign-on via the OpenHost zone's `zone_auth` cookie.
+app, with single sign-on driven by the OpenHost router's
+`X-OpenHost-Is-Owner` trusted header.
 
 ## What you get
 
@@ -12,8 +13,8 @@ app, with single sign-on via the OpenHost zone's `zone_auth` cookie.
   - Redis (currently 8.x on Trixie), private to the container,
     used for file locking + memory cache
   - A small Python auth-sidecar in front of Apache that bridges
-    OpenHost's `zone_auth` JWT cookie to Nextcloud's `user_saml` app
-    in environment-variable mode
+    OpenHost's owner signal (the `X-OpenHost-Is-Owner` header) to
+    Nextcloud's `user_saml` app in environment-variable mode
   - tini as PID 1 to reap zombies and forward signals
 - Persistent state under `$OPENHOST_APP_DATA_DIR`:
   - `pgdata/` — PostgreSQL cluster
@@ -22,10 +23,20 @@ app, with single sign-on via the OpenHost zone's `zone_auth` cookie.
     the generated redis.conf, so this directory typically stays
     empty — Redis is used as a non-persistent cache + file lock
     backend only.
-  - The Nextcloud upstream image's standard volumes
-    (`/var/www/html/data`, `/var/www/html/config`, custom apps, etc.)
-    are bind-mounted under the upstream image's own paths, which are
-    inside the container filesystem
+  - `html/` — Nextcloud's persisted application state.  The upstream
+    image mounts `/var/www/html` as an anonymous podman VOLUME, which
+    OpenHost does NOT persist across container rebuilds, so we keep
+    the pieces that must survive a rebuild here instead:
+    `html/config.php` (config.php with DB creds, instanceid, secret,
+    the user_saml settings), `html/version.php` (drives the upstream
+    entrypoint's install-vs-upgrade decision), `html/data/` (user
+    uploads + `nextcloud.log`, via `NEXTCLOUD_DATA_DIR`), and
+    `html/custom_apps/` + `html/themes/`.  On each boot `start.sh`
+    copies this state into the fresh volume before the upstream
+    entrypoint runs and copies it back out once Apache is up.  Without
+    this a rebuild would re-run `maintenance:install` against the
+    still-populated Postgres DB and wedge on "The Login is already
+    being used".
   - `.postgres_password` — chmod 644.  Regenerated only when the
     file is missing OR present-but-empty/corrupt (truncated to zero
     bytes, all-whitespace, etc.).  An operator who hand-edits this
@@ -45,40 +56,54 @@ app, with single sign-on via the OpenHost zone's `zone_auth` cookie.
 
 There are TWO authentication rails because Nextcloud's native sync
 clients (Desktop / Android / iOS / WebDAV CLIs) do not carry the
-`zone_auth` cookie:
+OpenHost owner session:
 
 ### Rail 1: web UI (browser)
 
-1. The browser arrives at `nextcloud.<zone-domain>` carrying
-   `zone_auth` (set by the OpenHost router after the owner logs in
-   to the zone).
+1. The owner arrives at `nextcloud.<zone-domain>`. The OpenHost router
+   authenticates the owner via their zone `session_token` cookie and,
+   on success, stamps `X-OpenHost-Is-Owner: true` on the request it
+   forwards to the container.
 2. The OpenHost router treats every path under this app as
    "public" (`public_paths = ["/"]` in `openhost.toml`) so the
-   request reaches the auth-sidecar inside the container regardless
-   of `zone_auth`'s validity.
-3. The auth-sidecar verifies the `zone_auth` JWT against the router's
-   JWKS (`<router>/.well-known/jwks.json`, RS256). If the claim
-   `sub == "owner"` the sidecar **strips any client-supplied
-   `X-Openhost-User` header** and stamps `X-Openhost-User: admin`
-   (or `$NEXTCLOUD_ADMIN_USER`).
+   request reaches the auth-sidecar inside the container even when the
+   visitor is not the owner (needed for native-sync and public-share
+   traffic — see Rail 2). The router still runs owner authentication
+   and stamps the header when the owner is signed in.
+3. The auth-sidecar reads `X-OpenHost-Is-Owner`. Because the router is
+   the sole authority for that header — it strips any client-supplied
+   `X-OpenHost-*` header before adding its own — a value of `true` is
+   trustworthy. On owner requests the sidecar **strips any
+   client-supplied `X-Openhost-User` header** and stamps
+   `X-Openhost-User: admin` (or `$NEXTCLOUD_ADMIN_USER`).
 4. Nextcloud's `user_saml` app, configured in `environment-variable`
    mode with `general-uid_mapping=HTTP_X_OPENHOST_USER`, treats the
    stamped header as the authenticated user. On first login
    user_saml auto-creates the `admin` user.
 
-If the JWT is missing or invalid, the sidecar forwards the request
+If `X-OpenHost-Is-Owner` is absent, the sidecar forwards the request
 WITHOUT stamping the SSO header, and Nextcloud falls through to its
 own login page. This is the right fallback: the operator can always
 log in via the bootstrap admin password (saved to
 `admin_password.txt` — read it via the file-browser app).
+
+> **Note on the previous JWT approach.** Earlier revisions verified a
+> router-signed `zone_auth` JWT cookie against the router's JWKS
+> endpoint. Current OpenHost does not mint a `zone_auth` cookie for
+> apps at all — the trusted `X-OpenHost-Is-Owner` header is the only
+> owner signal — so relying on the (nonexistent) JWT left the owner
+> permanently unable to sign in ("Account not provisioned"). The
+> sidecar now consumes the header directly and no longer needs
+> `OPENHOST_ROUTER_URL` or any JWT/JWKS dependency.
 
 ### Rail 2: native sync clients
 
 1. The user opens the Nextcloud Desktop / Android / iOS app and
    chooses "log in" with the URL `https://nextcloud.<zone-domain>`.
 2. The client opens Login Flow v2 in the system browser. The system
-   browser already carries `zone_auth`, so the auth-sidecar
-   recognises the owner and the Login Flow v2 pages SSO straight
+   browser already carries the owner's OpenHost session, so the
+   router stamps `X-OpenHost-Is-Owner: true`, the auth-sidecar
+   recognises the owner, and the Login Flow v2 pages SSO straight
    through.
 3. Nextcloud mints an **app password** scoped to that client and
    returns it to the client process.
@@ -104,35 +129,43 @@ support per-app permissions (e.g. read-only).
 ### Why `public_paths = ["/"]` is safe
 
 `public_paths = ["/"]` tells the **OpenHost router** that no path
-under this app requires `zone_auth` at the router layer. A
-consequence is that the router ALSO does not strip
-client-supplied `X-OpenHost-Is-Owner` headers on those paths
-(the router only overwrites that header for authenticated owners).
-On the surface this looks like a privilege-escalation vector: a
-hostile client could simply send `X-OpenHost-Is-Owner: true` and
-have it propagate untouched through the router.
+under this app requires an authenticated owner at the router layer —
+so anonymous native-sync clients and public-share visitors are not
+bounced to the OpenHost `/login` page and can reach Nextcloud
+directly.
 
-The auth-sidecar closes that gap: it **unconditionally strips
-`X-Openhost-Is-Owner` AND `X-Openhost-User` from every incoming
-request before any other processing**, including on the bypass
-("public") paths. Owner status is then redetermined inside the
-sidecar by verifying the `zone_auth` JWT against the router's
-JWKS. A request that bypasses `zone_auth` entirely therefore
-cannot trick the sidecar into stamping owner identity, regardless
-of which paths are listed as router-public.
+Trusting the `X-OpenHost-Is-Owner` header is safe because the router
+is the sole authority for it: on EVERY request (public or not) the
+router strips any client-supplied `X-OpenHost-*` header before adding
+its own, and only adds `X-OpenHost-Is-Owner: true` after it has
+authenticated the owner's `session_token` cookie. A hostile client
+that sends its own `X-OpenHost-Is-Owner: true` has that header
+removed at the router before the sidecar ever sees it.
+
+As defence-in-depth against a misconfigured router, the auth-sidecar
+ALSO strips any inbound `X-Openhost-Is-Owner` and `X-Openhost-User`
+from the request before forwarding it upstream to Apache, and only
+stamps `X-Openhost-User` on protected (non-public) paths — so a
+public-share visitor is never auto-logged-in as the owner.
 
 ## First boot / installation
 
-OpenHost will pull the image and start the container. The upstream
-Nextcloud entrypoint detects an empty `/var/www/html` and runs
+OpenHost will pull the image and start the container. On first boot
+`start.sh` seeds the Nextcloud core code into the fresh
+`/var/www/html` volume and finds no persisted `config.php`/`version.php`
+in `$OPENHOST_APP_DATA_DIR/html`, so the upstream entrypoint runs
 `occ maintenance:install`, creating the database schema, the admin
 user (with the password from `$NEXTCLOUD_ADMIN_PASSWORD`), and
-seeding `config/config.php`. After that completes successfully the
-post-installation hook (`hooks/post-installation/01-openhost-sso.sh`)
-runs, installs the `user_saml` app, configures environment-variable
-mode, sets a few hardening flags (`upgrade.disable-web=true`,
-`default_phone_region`, ajax background mode), and then Apache
-starts.
+seeding `config/config.php` (with `datadirectory` pointed at
+`$OPENHOST_APP_DATA_DIR/html/data` via `NEXTCLOUD_DATA_DIR`). After
+that completes successfully the post-installation hook
+(`hooks/post-installation/01-openhost-sso.sh`) runs, installs the
+`user_saml` app, configures environment-variable mode, sets a few
+hardening flags (`upgrade.disable-web=true`, `default_phone_region`,
+ajax background mode), and then Apache starts. Once Apache is
+listening `start.sh` copies `config.php` + `version.php` out to
+`$OPENHOST_APP_DATA_DIR/html` so the next rebuild restores them and
+takes the upstream entrypoint's upgrade path instead of reinstalling.
 
 To retrieve the admin password:
 
@@ -154,10 +187,13 @@ Persistent state lives under `$OPENHOST_APP_DATA_DIR`:
   `pg_dump -h /run/postgresql -U nextcloud nextcloud` from inside
   the container, or copy the entire dir while Postgres is stopped.
 - `redis/` — In-memory cache; safe to skip (regenerated on demand).
-- The Nextcloud upstream image's `data/` and `config/` directories
-  live inside the container's `/var/www/html/`. They're persisted
-  by OpenHost via the upstream image's volume declarations on the
-  base image.
+- `html/` — Nextcloud's persisted application state:
+  `html/data/` (user uploads + `nextcloud.log`), `html/config.php`,
+  `html/version.php`, `html/custom_apps/`, `html/themes/`. Back up
+  `html/data/` and `html/config.php` together with `pgdata/` — they
+  are consistent only as a set. (The `/var/www/html` volume itself is
+  ephemeral and reconstructed from `html/` + the image on each boot,
+  so there is nothing to back up there.)
 - `.postgres_password` — needed to read the database back; do NOT
   lose this when restoring.
 - `admin_password.txt` — convenience copy of the bootstrap admin
@@ -185,7 +221,7 @@ Upgrades happen only by rebuilding the image with a newer base.
 | `APACHE_READY_TIMEOUT` | `90` | Seconds to wait for Apache to bind its listening port before declaring startup failed. |
 | `REDIS_READY_TIMEOUT` | `30` | Seconds to wait for Redis to respond to PING before declaring startup failed. |
 | `PG_WATCHDOG_INTERVAL` | `15` | Seconds between Postgres `pg_isready` probes. Three consecutive failures terminate the container so OpenHost restarts it. |
-| `AUTH_PROXY_LOG_LEVEL` | `INFO` | Python logging level for the sidecar. Set to `DEBUG` to log per-token JWT verification failures (helpful for diagnosing "I can't log in"). |
+| `AUTH_PROXY_LOG_LEVEL` | `INFO` | Python logging level for the sidecar. Set to `DEBUG` for verbose per-request logging (helpful for diagnosing routing/SSO issues). |
 
 The following variables are set by OpenHost itself and consumed
 internally by `start.sh`, the auth-sidecar, and the hooks; they're
@@ -194,11 +230,10 @@ what's happening:
 
 | Var | Source | Purpose |
 | --- | --- | --- |
-| `OPENHOST_ROUTER_URL` | OpenHost runtime | The internal URL of the OpenHost router (used by the auth-sidecar to fetch the JWKS). The sidecar refuses to start without this. |
 | `OPENHOST_ZONE_DOMAIN` | OpenHost runtime | The zone's public domain. Used to derive `NEXTCLOUD_DOMAIN`. |
 | `OPENHOST_APP_NAME` | OpenHost runtime | This app's name (`nextcloud`). Used to derive `NEXTCLOUD_DOMAIN`. |
 | `OPENHOST_APP_DATA_DIR` | OpenHost runtime | The persistent-data directory. Defaults to `/var/lib/openhost-nextcloud` if unset (which only happens in standalone testing). |
-| `OPENHOST_APP_TEMP_DATA_DIR` | OpenHost runtime | Per-boot scratch directory; redis.conf is written here. |
+| `OPENHOST_APP_TEMP_DIR` | OpenHost runtime | Per-boot scratch directory; redis.conf is written here. (The legacy name `OPENHOST_APP_TEMP_DATA_DIR` is also accepted as a fallback.) |
 | `OPENHOST_NEXTCLOUD_DOMAIN` | exported by `start.sh` | The resolved public hostname. The before-starting hook reads this to re-stamp `trusted_*` and `overwrite.*`. |
 
 The Nextcloud image's standard env vars (`POSTGRES_*`, `REDIS_*`,
@@ -211,7 +246,7 @@ also know how Nextcloud's first-install flow consumes them.
 
 - **One major upgrade at a time** (Nextcloud rule, not OpenHost).
 - **App passwords for sync clients can't be revoked from outside
-  Nextcloud.** If you revoke the zone owner's `zone_auth`, the web
+  Nextcloud.** If you end the zone owner's OpenHost session, the web
   UI logs them out immediately, but app passwords minted earlier
   remain valid until manually revoked via Settings → Security.
   This is the architectural reason this app maxes out at integration
