@@ -141,10 +141,14 @@ log "DATA_DIR=$DATA_DIR"
 #                         rebuild take the ``upgrade`` path.
 #   * custom_apps/      — apps installed after image build.
 #   * themes/           — custom themes.
-#   * data/             — user uploads + nextcloud.log + file cache;
-#                         handled separately via NEXTCLOUD_DATA_DIR
-#                         (see the env block below), which the upstream
-#                         install writes directly into app_data.
+#
+# User files (the ``datadirectory``: every user's uploads, plus
+# nextcloud.log and the preview appdata) do NOT live on app_data — they
+# live on the S3-backed ARCHIVE tier (see PERSIST_DATA_DIR / ARCHIVE_DIR
+# below and the env block).  They are therefore NOT part of this
+# copy-in/copy-out set: the archive is its own durable store and is
+# mounted directly into the container, so nothing about it needs
+# rebuild-time copying.
 #
 # We use a COPY-IN / COPY-OUT scheme rather than symlinks.  Symlinks
 # do not survive the upstream entrypoint: its top-level
