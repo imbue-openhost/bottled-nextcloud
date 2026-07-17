@@ -146,6 +146,26 @@ occ_or_warn "config:system:set overwriteprotocol" \
 occ_or_warn "config:system:set overwritehost" \
     config:system:set overwritehost --value="$DOMAIN"
 
+# tempdirectory: keep Nextcloud's scratch (chunked-upload assembly,
+# file conversions, zip-download staging) on LOCAL temp disk, not on
+# the S3-backed archive that now holds ``datadirectory``.  Writing GBs
+# of in-flight upload chunks straight to object storage would be slow
+# and would thrash the archive; the local temp mount is fast and
+# recreatable.  Nextcloud reads this at runtime, so re-stamping it each
+# boot keeps it pointed at the current temp mount.  Nextcloud requires
+# the directory to exist and be writable by www-data.
+NC_TEMP="${OPENHOST_APP_TEMP_DIR:-${OPENHOST_APP_TEMP_DATA_DIR:-}}"
+if [[ -n "$NC_TEMP" ]]; then
+    NC_TEMP="$NC_TEMP/nextcloud-tmp"
+    if mkdir -p "$NC_TEMP" 2>/dev/null; then
+        chown www-data:www-data "$NC_TEMP" 2>/dev/null || true
+        occ_or_warn "config:system:set tempdirectory" \
+            config:system:set tempdirectory --value="$NC_TEMP"
+    else
+        log "warning: could not create temp dir $NC_TEMP; leaving tempdirectory unset"
+    fi
+fi
+
 # user_saml's environment-variable mode reads $_SERVER['HTTP_X_OPENHOST_USER'].
 # Re-affirm the mapping every boot in case a future user_saml upgrade
 # resets it.
