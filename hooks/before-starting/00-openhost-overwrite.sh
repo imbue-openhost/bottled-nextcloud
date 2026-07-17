@@ -151,19 +151,15 @@ occ_or_warn "config:system:set overwritehost" \
 # the S3-backed archive that now holds ``datadirectory``.  Writing GBs
 # of in-flight upload chunks straight to object storage would be slow
 # and would thrash the archive; the local temp mount is fast and
-# recreatable.  Nextcloud reads this at runtime, so re-stamping it each
-# boot keeps it pointed at the current temp mount.  Nextcloud requires
-# the directory to exist and be writable by www-data.
-NC_TEMP="${OPENHOST_APP_TEMP_DIR:-${OPENHOST_APP_TEMP_DATA_DIR:-}}"
-if [[ -n "$NC_TEMP" ]]; then
-    NC_TEMP="$NC_TEMP/nextcloud-tmp"
-    if mkdir -p "$NC_TEMP" 2>/dev/null; then
-        chown www-data:www-data "$NC_TEMP" 2>/dev/null || true
-        occ_or_warn "config:system:set tempdirectory" \
-            config:system:set tempdirectory --value="$NC_TEMP"
-    else
-        log "warning: could not create temp dir $NC_TEMP; leaving tempdirectory unset"
-    fi
+# recreatable.  The directory is created + chowned by start.sh (which
+# runs as root) and its path handed to us via NEXTCLOUD_TMP_DIR; here
+# we only point Nextcloud's runtime ``tempdirectory`` at it, re-stamped
+# each boot so it tracks the current temp mount.
+if [[ -n "${NEXTCLOUD_TMP_DIR:-}" && -d "$NEXTCLOUD_TMP_DIR" ]]; then
+    occ_or_warn "config:system:set tempdirectory" \
+        config:system:set tempdirectory --value="$NEXTCLOUD_TMP_DIR"
+else
+    log "warning: NEXTCLOUD_TMP_DIR unset or missing; leaving tempdirectory at default"
 fi
 
 # user_saml's environment-variable mode reads $_SERVER['HTTP_X_OPENHOST_USER'].

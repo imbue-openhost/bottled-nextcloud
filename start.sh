@@ -85,9 +85,19 @@ ARCHIVE_DIR="${OPENHOST_APP_ARCHIVE_DIR:-/data/app_archive/${OPENHOST_APP_NAME:-
 # persist_html_state_in / persist_html_state_out below.
 HTML_DIR="/var/www/html"
 HTML_PERSIST="$DATA_DIR/html"
+# Nextcloud's scratch dir (chunked-upload assembly, file conversions,
+# zip-download staging).  Lives on LOCAL temp disk — never on the
+# S3-backed archive that holds the data dir.  Created + chowned here
+# in start.sh (which runs as root) because the before-starting hook
+# runs as the unprivileged www-data and can't mkdir under the
+# root-owned temp mount.  Exported so the hook can point Nextcloud's
+# ``tempdirectory`` config at it.
+export NEXTCLOUD_TMP_DIR="$TMP_DIR/nextcloud-tmp"
 
-mkdir -p "$DATA_DIR" "$TMP_DIR" "$REDIS_DIR" /run/postgresql /run/redis
+mkdir -p "$DATA_DIR" "$TMP_DIR" "$REDIS_DIR" "$NEXTCLOUD_TMP_DIR" /run/postgresql /run/redis
 chown postgres:postgres /run/postgresql 2>/dev/null || true
+# www-data (Apache+PHP) must be able to write scratch files here.
+chown www-data:www-data "$NEXTCLOUD_TMP_DIR" 2>/dev/null || true
 
 # ---------------------------------------------------------------------
 # Resolve the externally-facing host so Nextcloud's overwrite.* values
