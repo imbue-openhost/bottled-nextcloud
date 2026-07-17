@@ -183,15 +183,26 @@ persist_html_state_in() {
     # succeeds and is required for the install to proceed
     # ("Cannot create or write into the data directory ...").
     chown -R www-data:www-data "$HTML_PERSIST" 2>/dev/null || true
-    # The user-file data dir now lives on the archive mount, which is a
-    # separate mount from HTML_PERSIST — chown it too so www-data can
-    # write uploads there.  Only chown the app's OWN subdirectory (not
-    # the whole JuiceFS mount) and NOT recursively on every boot: a deep
-    # -R over an S3-backed FS with many files would be slow and pointless
-    # (existing files already have the right owner from when they were
-    # written).  A shallow chown of the data dir itself is enough for
-    # www-data to create children.
+    # The user-file data dir lives on the archive mount (a separate mount
+    # from HTML_PERSIST).  www-data must own it AND its contents — not just
+    # for uploads under ``<user>/files`` but also for Nextcloud's own
+    # ``appdata_<instanceid>`` (JS/preview caches it writes on the fly, e.g.
+    # when rendering a public share page).  Shallow-chown the parent dirs
+    # first so provisioning can create children.  Then, ONLY when the tree
+    # is not already www-data-owned, chown it recursively: this repairs the
+    # 0:0 ownership left by a platform-side ``local``->S3 migration (whose
+    # copy runs as namespace-root), while avoiding a slow deep -R over the
+    # S3-backed FS on every normal boot (where ownership is already right).
     chown www-data:www-data "$ARCHIVE_DIR" "$PERSIST_DATA_DIR" 2>/dev/null || true
+    if [[ -d "$PERSIST_DATA_DIR" ]]; then
+        # ``find -not -user www-data -print -quit`` returns a line iff at
+        # least one entry has the wrong owner — a cheap early-exit probe
+        # that doesn't walk the whole tree when everything is already fine.
+        if [[ -n "$(find "$PERSIST_DATA_DIR" -not -user www-data -print -quit 2>/dev/null)" ]]; then
+            log "archive data dir has non-www-data entries (e.g. after a local->S3 migration); chowning recursively"
+            chown -R www-data:www-data "$PERSIST_DATA_DIR" 2>/dev/null || true
+        fi
+    fi
 
     # Populate the Nextcloud CORE CODE into the fresh volume ourselves.
     #
