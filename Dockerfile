@@ -59,7 +59,16 @@ RUN set -eux; \
     # directories exist with the right ownership so the ``postgres``
     # user can write into them.
     mkdir -p /run/postgresql; \
-    chown postgres:postgres /run/postgresql
+    chown postgres:postgres /run/postgresql; \
+    # Nextcloud (Apache+PHP) runs as ``www-data`` and talks to Redis
+    # over the unix socket at /run/redis/redis.sock, which is created
+    # with group ``redis`` and mode 0770 (see start.sh).  Add www-data
+    # to the ``redis`` group so it can open that socket; without this,
+    # Nextcloud's Redis cache/locking calls fail with a permission
+    # error the moment the socket transport is used.  Both the Debian
+    # redis-server and postgresql packages create their users/groups
+    # during install above, so this runs after they exist.
+    usermod -aG redis www-data
 
 # Tell Apache to listen on $APACHE_PORT instead of the default 80.
 # Apache's default ``Listen 80`` is configured in

@@ -519,9 +519,15 @@ fi
 # Start Redis (foreground child of our shell)
 # ---------------------------------------------------------------------
 REDIS_CONF="$TMP_DIR/redis.conf"
+# Prefer the unix socket for Nextcloud <-> Redis traffic: it's faster
+# than the TCP loopback and needs no port.  We disable TCP entirely
+# (``port 0``) so Redis is reachable ONLY via the socket — nothing
+# outside this container can reach it, and even in-container processes
+# must be in the ``redis`` group (``unixsocketperm 770``) to connect.
+# Nextcloud (Apache+PHP running as www-data) is added to the ``redis``
+# group in the Dockerfile so it can open the socket.
 cat > "$REDIS_CONF" <<EOF
-bind 127.0.0.1
-port 6379
+port 0
 unixsocket /run/redis/redis.sock
 unixsocketperm 770
 dir $REDIS_DIR
@@ -597,8 +603,21 @@ export POSTGRES_HOST="127.0.0.1"
 export POSTGRES_DB="nextcloud"
 export POSTGRES_USER="nextcloud"
 export POSTGRES_PASSWORD
-export REDIS_HOST="127.0.0.1"
-export REDIS_HOST_PORT="6379"
+# Point Nextcloud at the Redis UNIX SOCKET.  The upstream image's
+# redis.config.php treats a REDIS_HOST beginning with "/" as a socket
+# path and, in that case, omits the port entirely (see the base
+# image's config/redis.config.php).  Redis itself has TCP disabled
+# (``port 0`` in the generated redis.conf above), so the socket is the
+# only transport.  This wires Redis in as Nextcloud's distributed
+# cache AND file-locking backend (memcache.distributed +
+# memcache.locking), which redis.config.php sets whenever REDIS_HOST
+# is present; APCu (apcu.config.php) remains the local cache.
+export REDIS_HOST="/run/redis/redis.sock"
+# REDIS_HOST_PORT intentionally unset: redis.config.php skips the port
+# for a socket-path host.  Leaving a stale "6379" here would make the
+# config include ``'port' => 6379`` alongside a socket host, which the
+# phpredis client rejects.
+unset REDIS_HOST_PORT
 export NEXTCLOUD_ADMIN_USER="${NEXTCLOUD_ADMIN_USER:-admin}"
 export NEXTCLOUD_ADMIN_PASSWORD
 # Persist user data in app_data (NOT the ephemeral /var/www/html
