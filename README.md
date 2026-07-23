@@ -163,12 +163,14 @@ in `$OPENHOST_APP_DATA_DIR/html`, so the upstream entrypoint runs
 user (with the password from `$NEXTCLOUD_ADMIN_PASSWORD`), and
 seeding `config/config.php` (with `datadirectory` pointed at
 `$OPENHOST_APP_DATA_DIR/html/data` via `NEXTCLOUD_DATA_DIR`). After
-that completes successfully the post-installation hook
-(`hooks/post-installation/01-openhost-sso.sh`) runs, installs the
-`user_saml` app, configures environment-variable mode, sets a few
-hardening flags (`upgrade.disable-web=true`, `default_phone_region`,
-ajax background mode), and then Apache starts. Once Apache is
-listening `start.sh` copies `config.php` + `version.php` out to
+that completes successfully the post-installation hooks run:
+`01-openhost-sso.sh` installs the `user_saml` app, configures
+environment-variable mode, and sets a few hardening flags
+(`upgrade.disable-web=true`, `default_phone_region`, ajax background
+mode); then `02-openhost-extensions.sh` installs the pre-configured
+extensions (see below). Apache then starts. Once Apache is
+listening `start.sh` copies `config.php` + `version.php` + the
+installed extensions (`custom_apps/`) out to
 `$OPENHOST_APP_DATA_DIR/html` so the next rebuild restores them and
 takes the upstream entrypoint's upgrade path instead of reinstalling.
 
@@ -183,6 +185,42 @@ The first time you visit `https://nextcloud.<zone-domain>` as the
 zone owner, user_saml auto-provisions the SAML-authenticated `admin`
 user. From then on you don't need the password for normal web use —
 it's there as a break-glass credential.
+
+## Pre-configured extensions
+
+A fresh install ships with the common "Nextcloud Hub" productivity
+extensions already installed and enabled, so the instance is useful
+out of the box instead of a bare Files-only server. The default set
+(installed on first boot by
+`hooks/post-installation/02-openhost-extensions.sh`) is:
+
+| App | What it adds |
+| --- | --- |
+| `calendar` | CalDAV calendar UI |
+| `contacts` | CardDAV address-book UI |
+| `notes` | Markdown notes (also powers the mobile Notes app) |
+| `tasks` | CalDAV task lists (VTODO), pairs with calendar |
+| `deck` | Kanban boards |
+
+These are official, actively-maintained apps that install cleanly on
+`nextcloud:33-apache` with no extra system packages. They install into
+`custom_apps/` and are persisted to `$OPENHOST_APP_DATA_DIR/html` by
+the same copy-out that persists `config.php`, so they survive rebuilds.
+
+Customise the set with the `NEXTCLOUD_PRECONFIGURED_APPS` env var
+(space- or comma-separated app-store IDs), e.g.
+`calendar contacts mail forms`. Set it to `none` to deploy a bare
+Files-only install. The installs are **best-effort**: a store outage,
+rate-limit, or a single incompatible app is logged and skipped — it
+never blocks the boot, because the instance is fully usable without
+the extras. Any extension you install later from the web UI also
+persists across rebuilds: it lands in `custom_apps/`, which is copied
+out to `$OPENHOST_APP_DATA_DIR/html` both once per boot (after Apache
+starts) and again on graceful shutdown (the `SIGTERM` teardown path in
+`start.sh`), so a normal OpenHost stop/redeploy captures it. A hard
+kill (ungraceful host crash) between installing an app and the next
+graceful stop is the only case where a freshly-installed extension
+could be lost on the following rebuild.
 
 ## Backup
 
@@ -220,6 +258,7 @@ Upgrades happen only by rebuilding the image with a newer base.
 | Var | Default | Purpose |
 | --- | --- | --- |
 | `NEXTCLOUD_ADMIN_USER` | `admin` | The local Nextcloud user that the auth-sidecar's `X-Openhost-User` stamp identifies. user_saml auto-creates this account on first SSO login. |
+| `NEXTCLOUD_PRECONFIGURED_APPS` | `calendar contacts notes tasks deck` | Space- or comma-separated list of Nextcloud app-store IDs to install + enable on first boot (see "Pre-configured extensions" below). Set to `none` (or `-`/`off`/`false`) to deploy a bare Files-only install. Installs are best-effort: an app-store outage or a single failing app is logged and skipped, never fatal. |
 | `NEXTCLOUD_DOMAIN` | `${OPENHOST_APP_NAME}.${OPENHOST_ZONE_DOMAIN}` | The public hostname the app is served at; used for `trusted_domains` and `overwrite.*`. |
 | `AUTH_PROXY_LISTEN_PORT` | `8080` | The port the auth-sidecar binds. Must match `[runtime.container].port` in `openhost.toml`. |
 | `APACHE_PORT` | `8081` | The port Apache binds inside the container; the auth-sidecar proxies to `127.0.0.1:$APACHE_PORT`. The value is baked into Apache's `ports.conf` and the default vhost at build time via `sed`, AND read at runtime by `start.sh` (for the readiness probe) and `auth_proxy.py` (for the upstream target). Setting this at runtime changes only the readiness probe and proxy target — Apache itself is still bound to the build-time value, so a runtime override would point the proxy at a port nothing is listening on. **Effectively build-time only.** Operators wanting a different port must rebuild the image. |
