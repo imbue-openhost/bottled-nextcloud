@@ -34,14 +34,29 @@ app, with single sign-on driven by the OpenHost router's
     the pieces that must survive a rebuild here instead:
     `html/config.php` (config.php with DB creds, instanceid, secret,
     the user_saml settings), `html/version.php` (drives the upstream
-    entrypoint's install-vs-upgrade decision), `html/data/` (user
-    uploads + `nextcloud.log`, via `NEXTCLOUD_DATA_DIR`), and
+    entrypoint's install-vs-upgrade decision), and
     `html/custom_apps/` + `html/themes/`.  On each boot `start.sh`
     copies this state into the fresh volume before the upstream
     entrypoint runs and copies it back out once Apache is up.  Without
     this a rebuild would re-run `maintenance:install` against the
     still-populated Postgres DB and wedge on "The Login is already
-    being used".
+    being used".  Note: user files do NOT live here — they're on the
+    S3-backed archive tier (see below).
+
+- User-file storage on the **archive tier** (`$OPENHOST_APP_ARCHIVE_DIR`,
+  i.e. `/data/app_archive/nextcloud/`): Nextcloud's `datadirectory`
+  (every user's uploaded files, plus `nextcloud.log` and the preview
+  `appdata`) is set to `.../data` on the S3-backed archive mount. This
+  is why the manifest declares `app_archive = true`. Uploads therefore
+  scale elastically to the operator's object storage instead of being
+  capped by — and bloating restic backups of — the local app_data
+  disk. Postgres, config.php and version.php stay on local disk (they
+  need fast fsync semantics and must never move to the archive), and
+  Nextcloud's scratch `tempdirectory` (chunked-upload assembly, file
+  conversions) is pinned to local `app_temp_data`. **Because
+  `app_archive = true`, OpenHost refuses to install/reload this app
+  until the zone's S3 archive backend is configured from the
+  dashboard.**
   - `.postgres_password` — chmod 644.  Regenerated only when the
     file is missing OR present-but-empty/corrupt (truncated to zero
     bytes, all-whitespace, etc.).  An operator who hand-edits this
@@ -162,7 +177,8 @@ in `$OPENHOST_APP_DATA_DIR/html`, so the upstream entrypoint runs
 `occ maintenance:install`, creating the database schema, the admin
 user (with the password from `$NEXTCLOUD_ADMIN_PASSWORD`), and
 seeding `config/config.php` (with `datadirectory` pointed at
-`$OPENHOST_APP_DATA_DIR/html/data` via `NEXTCLOUD_DATA_DIR`). After
+`$OPENHOST_APP_ARCHIVE_DIR/data` — the S3-backed archive tier — via
+`NEXTCLOUD_DATA_DIR`). After
 that completes successfully the post-installation hooks run:
 `01-openhost-sso.sh` installs the `user_saml` app, configures
 environment-variable mode, and sets a few hardening flags
@@ -231,12 +247,19 @@ Persistent state lives under `$OPENHOST_APP_DATA_DIR`:
   the container, or copy the entire dir while Postgres is stopped.
 - `redis/` — In-memory cache; safe to skip (regenerated on demand).
 - `html/` — Nextcloud's persisted application state:
-  `html/data/` (user uploads + `nextcloud.log`), `html/config.php`,
-  `html/version.php`, `html/custom_apps/`, `html/themes/`. Back up
-  `html/data/` and `html/config.php` together with `pgdata/` — they
-  are consistent only as a set. (The `/var/www/html` volume itself is
-  ephemeral and reconstructed from `html/` + the image on each boot,
-  so there is nothing to back up there.)
+  `html/config.php`, `html/version.php`, `html/custom_apps/`,
+  `html/themes/`. Back up `html/config.php` together with `pgdata/`
+  and the archive-tier user files — they are consistent only as a set.
+  (The `/var/www/html` volume itself is ephemeral and reconstructed
+  from `html/` + the image on each boot, so there is nothing to back
+  up there.)
+- **User files** live on the S3-backed archive tier
+  (`$OPENHOST_APP_ARCHIVE_DIR/data`), NOT under `$OPENHOST_APP_DATA_DIR`.
+  Their durability is whatever the operator's configured S3 provider
+  offers; the OpenHost backup app deliberately excludes the archive
+  tier from restic snapshots (it is already durable object storage).
+  Back it up, if you want a second copy, via your S3 provider's own
+  versioning/replication.
 - `.postgres_password` — needed to read the database back; do NOT
   lose this when restoring.
 - `admin_password.txt` — convenience copy of the bootstrap admin
