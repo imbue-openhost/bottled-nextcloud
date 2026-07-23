@@ -4,7 +4,8 @@
 # things that would normally be separate containers in a docker-compose
 # deployment: the Nextcloud Apache + PHP stack, PostgreSQL, Redis, and
 # a small Python auth-sidecar that fronts Apache and bridges OpenHost's
-# zone_auth cookie to Nextcloud's user_saml app.
+# owner signal (the router-stamped X-OpenHost-Is-Owner header) to
+# Nextcloud's user_saml app.
 #
 # The Nextcloud upstream image's entrypoint (which handles install,
 # upgrade, and hooks) is preserved verbatim — we just call it from a
@@ -34,10 +35,10 @@ ENV APACHE_PORT=8081
 # without it Nextcloud's first-boot ``occ maintenance:install`` would
 # flap if Postgres is still starting.
 #
-# python3 is needed for the auth-sidecar.  Debian's ``python3-jwt``
-# is the PyJWT package (despite the name) — verified at runtime via
-# ``jwt.algorithms.RSAAlgorithm.from_jwk`` etc.  ``python3-requests``
-# and ``python3-cryptography`` are pulled in for the same auth-sidecar.
+# python3 is needed for the auth-sidecar.  The sidecar uses only the
+# Python standard library (http.server, socket, re) — owner status is
+# read from the trusted ``X-OpenHost-Is-Owner`` header the router
+# stamps, so no JWT/JWKS/HTTP-client dependencies are required.
 #
 # tini gives us a real PID 1 that reaps zombies and forwards signals,
 # matching the supervisor pattern used by openhost-miniflux.
@@ -48,9 +49,6 @@ RUN set -eux; \
         postgresql-client \
         redis-server \
         python3 \
-        python3-jwt \
-        python3-cryptography \
-        python3-requests \
         tini; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*; \

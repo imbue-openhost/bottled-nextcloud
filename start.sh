@@ -43,11 +43,38 @@ set -euo pipefail
 log() { printf '[start.sh] %s\n' "$*" >&2; }
 
 DATA_DIR="${OPENHOST_APP_DATA_DIR:-/var/lib/openhost-nextcloud}"
-TMP_DIR="${OPENHOST_APP_TEMP_DATA_DIR:-/tmp/openhost-nextcloud}"
+# OpenHost exposes the per-boot scratch mount as OPENHOST_APP_TEMP_DIR.
+# (An earlier revision read OPENHOST_APP_TEMP_DATA_DIR, which OpenHost
+# never sets — so TMP_DIR always fell back to a non-persistent /tmp
+# path.  Accept both names for backwards compatibility, preferring the
+# one OpenHost actually provides.)
+TMP_DIR="${OPENHOST_APP_TEMP_DIR:-${OPENHOST_APP_TEMP_DATA_DIR:-/tmp/openhost-nextcloud}}"
 PG_DATA="$DATA_DIR/pgdata"
 REDIS_DIR="$DATA_DIR/redis"
 PG_PASSWORD_FILE="$DATA_DIR/.postgres_password"
 ADMIN_PASSWORD_FILE="$DATA_DIR/admin_password.txt"
+# Nextcloud keeps its whole application tree (core code, installed
+# apps, the config/ dir with config.php, and — by default — the data/
+# uploads dir) under /var/www/html.  The upstream image declares that
+# path as an anonymous VOLUME, but OpenHost does NOT persist
+# container volumes across rebuilds: every ``update`` reload gives the
+# container a fresh empty /var/www/html.  With an empty tree the
+# upstream entrypoint sees no version.php, decides the instance is
+# uninstalled, and runs ``maintenance:install`` again — which then
+# collides with the STILL-persistent Postgres database
+# ("The Login is already being used") and wedges the container in a
+# retry loop.
+#
+# We therefore keep the state that must survive a rebuild on the
+# persistent app_data mount (HTML_PERSIST) and, on each boot, copy it
+# INTO the fresh /var/www/html volume before the upstream entrypoint
+# runs and copy it back OUT once Apache is up — so config.php and
+# version.php survive rebuilds and the upstream entrypoint takes its
+# ``upgrade`` path instead of ``install``.  A bind mount would be
+# simpler but is denied under rootless podman.  See
+# persist_html_state_in / persist_html_state_out below.
+HTML_DIR="/var/www/html"
+HTML_PERSIST="$DATA_DIR/html"
 
 mkdir -p "$DATA_DIR" "$TMP_DIR" "$REDIS_DIR" /run/postgresql /run/redis
 chown postgres:postgres /run/postgresql 2>/dev/null || true
@@ -76,6 +103,136 @@ resolve_domain() {
 DOMAIN="$(resolve_domain)"
 log "DOMAIN=$DOMAIN"
 log "DATA_DIR=$DATA_DIR"
+
+# ---------------------------------------------------------------------
+# Persist Nextcloud's state across container rebuilds.
+#
+# /var/www/html is an ephemeral podman volume under OpenHost.  We keep
+# the pieces of Nextcloud state that MUST survive a rebuild on the
+# persistent app_data mount:
+#
+#   * config/config.php — DB creds, instanceid, secret, trusted_domains,
+#                         the user_saml settings, ...  Without it a
+#                         rebuild re-runs ``maintenance:install`` and
+#                         collides with the persistent Postgres DB
+#                         ("The Login is already being used").
+#   * version.php       — the upstream entrypoint reads this to decide
+#                         install-vs-upgrade; persisting it makes a
+#                         rebuild take the ``upgrade`` path.
+#   * custom_apps/      — apps installed after image build.
+#   * themes/           — custom themes.
+#   * data/             — user uploads + nextcloud.log + file cache;
+#                         handled separately via NEXTCLOUD_DATA_DIR
+#                         (see the env block below), which the upstream
+#                         install writes directly into app_data.
+#
+# We use a COPY-IN / COPY-OUT scheme rather than symlinks.  Symlinks
+# do not survive the upstream entrypoint: its top-level
+# ``rsync --delete --exclude-from=/upgrade.exclude`` removes a
+# destination ``config`` symlink (the ``/config/`` exclude protects
+# the contents from transfer but not the symlink from --delete), and
+# its ``rsync --include /version.php`` replaces a dangling
+# version.php symlink with a real file.  Both were verified
+# empirically.  Copy-in before the entrypoint runs, copy-out after
+# it has settled (persist_html_state_out, called once Apache is up).
+PERSIST_DATA_DIR="$HTML_PERSIST/data"
+PERSIST_DIRS=(custom_apps themes)
+
+# Copy persistent state INTO the fresh volume before the upstream
+# entrypoint runs, so it sees an existing install (version.php +
+# config.php present) and takes the upgrade path instead of
+# reinstalling.
+persist_html_state_in() {
+    mkdir -p "$HTML_PERSIST" "$PERSIST_DATA_DIR"
+    # The app_data mount is created owned by the container's root
+    # (uid 0), but the upstream install and Apache run as www-data
+    # (uid 33) and must be able to create/write the data dir and the
+    # persisted tree.  chown the whole persistent tree up front.  This
+    # may fail under rootless podman's uid remapping (hence ``|| true``
+    # elsewhere) but on OpenHost the container is root-in-userns so it
+    # succeeds and is required for the install to proceed
+    # ("Cannot create or write into the data directory ...").
+    chown -R www-data:www-data "$HTML_PERSIST" 2>/dev/null || true
+
+    # Populate the Nextcloud CORE CODE into the fresh volume ourselves.
+    #
+    # The upstream entrypoint only rsyncs /usr/src/nextcloud into
+    # /var/www/html when it decides the on-disk version is OLDER than
+    # the image version.  Once we restore a persisted version.php (so a
+    # rebuild takes the upgrade path instead of reinstalling), the
+    # on-disk version EQUALS the image version, so the entrypoint skips
+    # that rsync entirely — leaving a fresh volume with NO index.php or
+    # core code and Apache serving 403.  We therefore seed the code
+    # ourselves whenever the volume is missing it, mirroring the
+    # entrypoint's own rsync but WITHOUT --delete (we must not wipe the
+    # config/version.php we are about to restore) and excluding the
+    # state paths we manage.  The ``! -f index.php`` guard means this
+    # only runs on a fresh/empty volume, so the (rare) boot where code
+    # is already present skips it entirely.
+    if [[ ! -f "$HTML_DIR/index.php" ]]; then
+        log "seeding Nextcloud core code into fresh volume"
+        # Copy everything EXCEPT version.php and data (we manage those).
+        # We DO let the image's config/ defaults (redis.config.php,
+        # reverse-proxy.config.php, apcu.config.php, ...) through — the
+        # persisted config.php is layered on top afterwards.  No
+        # --delete: we must not wipe state we're about to restore.
+        rsync -rlD \
+            --exclude '/data/***' \
+            --exclude '/version.php' \
+            /usr/src/nextcloud/ "$HTML_DIR/" \
+            || log "warning: core code seed rsync returned non-zero"
+        chown -R www-data:www-data "$HTML_DIR" 2>/dev/null || true
+    fi
+    if [[ -f "$HTML_PERSIST/config.php" ]]; then
+        log "restoring persisted config.php into volume"
+        mkdir -p "$HTML_DIR/config"
+        cp -a "$HTML_PERSIST/config.php" "$HTML_DIR/config/config.php"
+    fi
+    if [[ -f "$HTML_PERSIST/version.php" ]]; then
+        log "restoring persisted version.php into volume"
+        cp -a "$HTML_PERSIST/version.php" "$HTML_DIR/version.php"
+    fi
+    local d
+    for d in "${PERSIST_DIRS[@]}"; do
+        if [[ -d "$HTML_PERSIST/$d" ]] && [[ -n "$(ls -A "$HTML_PERSIST/$d" 2>/dev/null)" ]]; then
+            log "restoring persisted $d into volume"
+            mkdir -p "$HTML_DIR/$d"
+            cp -a "$HTML_PERSIST/$d/." "$HTML_DIR/$d/"
+        fi
+    done
+    chown -R www-data:www-data "$HTML_DIR/config" "$HTML_DIR/version.php" 2>/dev/null || true
+}
+
+# Copy state BACK OUT to persistent storage after the entrypoint has
+# installed/upgraded.  Called once Apache is confirmed listening, so
+# config.php (written by maintenance:install) and the current
+# version.php exist.  Idempotent: safe to run on every boot.
+persist_html_state_out() {
+    if [[ -f "$HTML_DIR/config/config.php" ]]; then
+        cp -a "$HTML_DIR/config/config.php" "$HTML_PERSIST/config.php.partial" \
+            && mv "$HTML_PERSIST/config.php.partial" "$HTML_PERSIST/config.php" \
+            && log "persisted config.php to app_data" \
+            || log "warning: failed to persist config.php"
+    fi
+    if [[ -f "$HTML_DIR/version.php" ]]; then
+        cp -a "$HTML_DIR/version.php" "$HTML_PERSIST/version.php.partial" \
+            && mv "$HTML_PERSIST/version.php.partial" "$HTML_PERSIST/version.php" \
+            && log "persisted version.php to app_data" \
+            || log "warning: failed to persist version.php"
+    fi
+    local d
+    for d in "${PERSIST_DIRS[@]}"; do
+        if [[ -d "$HTML_DIR/$d" ]] && [[ -n "$(ls -A "$HTML_DIR/$d" 2>/dev/null)" ]]; then
+            mkdir -p "$HTML_PERSIST/$d"
+            cp -a "$HTML_DIR/$d/." "$HTML_PERSIST/$d/" 2>/dev/null \
+                && log "persisted $d to app_data" \
+                || log "warning: failed to persist $d"
+        fi
+    done
+    chown -R www-data:www-data "$HTML_PERSIST" 2>/dev/null || true
+}
+mkdir -p "$HTML_PERSIST"
+persist_html_state_in
 
 # ---------------------------------------------------------------------
 # Generate / load the postgres password.  We keep it in a side file
@@ -444,6 +601,14 @@ export REDIS_HOST="127.0.0.1"
 export REDIS_HOST_PORT="6379"
 export NEXTCLOUD_ADMIN_USER="${NEXTCLOUD_ADMIN_USER:-admin}"
 export NEXTCLOUD_ADMIN_PASSWORD
+# Persist user data in app_data (NOT the ephemeral /var/www/html
+# volume).  The upstream entrypoint passes this to
+# ``occ maintenance:install --data-dir`` on first boot and, once
+# config.php records ``datadirectory``, Nextcloud keeps using it on
+# every subsequent boot regardless of this env var — but we keep
+# exporting it so a from-scratch reinstall (wiped app_data) lands in
+# the right place too.
+export NEXTCLOUD_DATA_DIR="$PERSIST_DATA_DIR"
 # trusted_domains: the public hostname.  We add 127.0.0.1 too so
 # health-check probes from inside the container don't get rejected.
 export NEXTCLOUD_TRUSTED_DOMAINS="$DOMAIN 127.0.0.1 localhost"
@@ -514,6 +679,13 @@ if [[ "$apache_ready" != "1" ]]; then
     wait "$APACHE_PID" || true
     exit 1
 fi
+
+# Apache is up, which means the upstream entrypoint has finished its
+# install/upgrade and written config.php + version.php.  Copy that
+# state back out to app_data so the next rebuild restores it.  This
+# is the second half of the copy-in / copy-out persistence scheme
+# (see persist_html_state_in at the top of this script).
+persist_html_state_out
 
 log "starting auth-proxy on :${AUTH_PROXY_LISTEN_PORT:-8080}"
 python3 /usr/local/bin/auth_proxy.py &
