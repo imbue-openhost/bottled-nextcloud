@@ -367,7 +367,75 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         except OSError as exc:
             log.debug("client disconnected before error response: %s", exc)
 
+    def _should_serve_starting_placeholder(self) -> bool:
+        """Whether to answer with a cold-start placeholder when Apache is
+        unreachable.  Only for top-level GET/HEAD navigations — API,
+        WebDAV, and asset requests still get a 502 so non-browser clients
+        see a real error rather than an HTML page they can't use."""
+        if self.command not in ("GET", "HEAD"):
+            return False
+        path_only = self.path.split("?", 1)[0]
+        return path_only in ("", "/", "/login")
+
+    def _send_ok_placeholder(self, *, healthz: bool = False) -> None:
+        """Minimal 200 used for the /_healthz liveness probe."""
+        body = b'{"status":"ok"}' if healthz else b"ok"
+        ctype = "application/json" if healthz else "text/plain; charset=utf-8"
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except OSError as exc:
+            log.debug("client disconnected during placeholder: %s", exc)
+
+    def _send_starting_placeholder(self) -> None:
+        """Auto-refreshing 200 page shown while Nextcloud finishes its
+        (slow) first boot and Apache isn't listening yet."""
+        body = (
+            b"<!doctype html><html><head><meta charset='utf-8'>"
+            b"<meta http-equiv='refresh' content='5'>"
+            b"<title>Starting\xe2\x80\xa6</title></head>"
+            b"<body style='font-family:sans-serif;max-width:36rem;margin:4rem auto;text-align:center'>"
+            b"<h1>Nextcloud is starting\xe2\x80\xa6</h1>"
+            b"<p>First boot installs the database and pre-configures apps; "
+            b"this can take a couple of minutes. This page refreshes "
+            b"automatically.</p></body></html>"
+        )
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Retry-After", "5")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except OSError as exc:
+            log.debug("client disconnected during starting placeholder: %s", exc)
+
     def _proxy(self) -> None:
+        # Liveness endpoint, served by the proxy itself without touching
+        # Apache.  OpenHost's readiness probe (compute_space
+        # wait_for_ready) polls the container port with only a ~60s
+        # deadline and treats any status >= 500 (or a refused connection)
+        # as "not ready".  Nextcloud's first boot — Postgres init,
+        # install, SSO config, and pre-installing the Hub extensions —
+        # runs well past that window, and the auth-proxy now starts
+        # BEFORE Apache is up (see start.sh) so it can answer this probe
+        # immediately.  A static 200 here means the app is never wrongly
+        # marked "error: App started but not responding to HTTP" just
+        # because Nextcloud booted slowly.
+        path_only = self.path.split("?", 1)[0]
+        if path_only == "/_healthz":
+            self._send_ok_placeholder(healthz=True)
+            return
+
         # Apply a generous read timeout to the client socket — large
         # uploads on slow networks legitimately take many minutes.
         # If the call fails (very unlikely; the socket should be in
@@ -471,8 +539,20 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 timeout=STREAM_TIMEOUT_SECONDS,
             )
         except OSError as exc:
-            log.warning("upstream connect failed: %s", exc)
-            self._safe_send_error(502, "Bad Gateway")
+            # Apache isn't up yet (first-boot install still running) or has
+            # gone away.  For a top-level browser navigation we serve a
+            # cheap auto-refreshing 200 "starting" page instead of a 502:
+            # this keeps OpenHost's readiness probe (which polls "/") green
+            # during the long first boot and shows a human a friendly page
+            # rather than a raw gateway error.  Non-root paths (API, WebDAV,
+            # assets) still get a 502 so sync clients and XHRs see a real
+            # error they can retry rather than an HTML placeholder.
+            if self._should_serve_starting_placeholder():
+                log.info("upstream not ready; serving cold-start placeholder: %s", exc)
+                self._send_starting_placeholder()
+            else:
+                log.warning("upstream connect failed: %s", exc)
+                self._safe_send_error(502, "Bad Gateway")
             return
 
         try:

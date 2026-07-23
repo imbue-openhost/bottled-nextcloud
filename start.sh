@@ -645,6 +645,24 @@ export APACHE_DISABLE_REWRITE_IP="1"
 # overwrite.* idempotently on every boot.
 export OPENHOST_NEXTCLOUD_DOMAIN="$DOMAIN"
 
+# ---------------------------------------------------------------------
+# Start the auth-proxy FIRST, before the (slow) Nextcloud first-boot
+# install.  The proxy is what listens on the OpenHost-routed port
+# (:8080), and OpenHost's readiness probe polls that port with only a
+# ~60s deadline.  Nextcloud's first boot (Postgres init + install + SSO
+# config + pre-installing the Hub extensions) runs well past 60s, so if
+# the proxy only started AFTER Apache was ready the app would be marked
+# "error: App started but not responding to HTTP" every first boot even
+# though it comes up fine minutes later.
+#
+# The proxy serves /_healthz and a cold-start placeholder on "/" while
+# Apache (127.0.0.1:$APACHE_PORT) is still unreachable, so the readiness
+# probe passes immediately; once Apache binds, real traffic flows
+# through.  The proxy has no start-time dependency on Apache being up.
+log "starting auth-proxy on :${AUTH_PROXY_LISTEN_PORT:-8080} (before nextcloud install)"
+python3 /usr/local/bin/auth_proxy.py &
+PROXY_PID=$!
+
 log "starting nextcloud (apache2-foreground via upstream entrypoint)"
 # The upstream ENTRYPOINT script runs install/upgrade hooks (which
 # includes our /docker-entrypoint-hooks.d/post-installation/01-openhost-sso.sh)
@@ -697,9 +715,10 @@ fi
 # (see persist_html_state_in at the top of this script).
 persist_html_state_out
 
-log "starting auth-proxy on :${AUTH_PROXY_LISTEN_PORT:-8080}"
-python3 /usr/local/bin/auth_proxy.py &
-PROXY_PID=$!
+# (The auth-proxy was already started above, before the Nextcloud
+# install, so it could answer OpenHost's readiness probe during the
+# slow first boot.  It is now transparently forwarding to the
+# now-ready Apache.)
 
 # Postgres was started via ``pg_ctl start`` so it's NOT a direct child
 # of this shell — ``wait -n`` cannot see it die.  Without intervention,
