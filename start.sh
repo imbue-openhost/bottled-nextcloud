@@ -53,6 +53,16 @@ PG_DATA="$DATA_DIR/pgdata"
 REDIS_DIR="$DATA_DIR/redis"
 PG_PASSWORD_FILE="$DATA_DIR/.postgres_password"
 ADMIN_PASSWORD_FILE="$DATA_DIR/admin_password.txt"
+# Archive tier: S3-backed (JuiceFS) storage the operator configures once
+# per zone from the OpenHost dashboard.  We put Nextcloud's user-file
+# data directory here so uploads scale elastically to object storage
+# instead of being capped by (and bloating backups of) the local
+# app_data disk.  OpenHost exposes it in-container via
+# OPENHOST_APP_ARCHIVE_DIR (mounted at /data/app_archive/<app>).  This
+# app declares ``app_archive = true`` in openhost.toml, so OpenHost will
+# refuse to install/reload it until the operator has configured the S3
+# backend — the archive dir is therefore always present at boot.
+ARCHIVE_DIR="${OPENHOST_APP_ARCHIVE_DIR:-/data/app_archive/${OPENHOST_APP_NAME:-nextcloud}}"
 # Nextcloud keeps its whole application tree (core code, installed
 # apps, the config/ dir with config.php, and — by default — the data/
 # uploads dir) under /var/www/html.  The upstream image declares that
@@ -75,9 +85,19 @@ ADMIN_PASSWORD_FILE="$DATA_DIR/admin_password.txt"
 # persist_html_state_in / persist_html_state_out below.
 HTML_DIR="/var/www/html"
 HTML_PERSIST="$DATA_DIR/html"
+# Nextcloud's scratch dir (chunked-upload assembly, file conversions,
+# zip-download staging).  Lives on LOCAL temp disk — never on the
+# S3-backed archive that holds the data dir.  Created + chowned here
+# in start.sh (which runs as root) because the before-starting hook
+# runs as the unprivileged www-data and can't mkdir under the
+# root-owned temp mount.  Exported so the hook can point Nextcloud's
+# ``tempdirectory`` config at it.
+export NEXTCLOUD_TMP_DIR="$TMP_DIR/nextcloud-tmp"
 
-mkdir -p "$DATA_DIR" "$TMP_DIR" "$REDIS_DIR" /run/postgresql /run/redis
+mkdir -p "$DATA_DIR" "$TMP_DIR" "$REDIS_DIR" "$NEXTCLOUD_TMP_DIR" /run/postgresql /run/redis
 chown postgres:postgres /run/postgresql 2>/dev/null || true
+# www-data (Apache+PHP) must be able to write scratch files here.
+chown www-data:www-data "$NEXTCLOUD_TMP_DIR" 2>/dev/null || true
 
 # ---------------------------------------------------------------------
 # Resolve the externally-facing host so Nextcloud's overwrite.* values
@@ -121,10 +141,14 @@ log "DATA_DIR=$DATA_DIR"
 #                         rebuild take the ``upgrade`` path.
 #   * custom_apps/      — apps installed after image build.
 #   * themes/           — custom themes.
-#   * data/             — user uploads + nextcloud.log + file cache;
-#                         handled separately via NEXTCLOUD_DATA_DIR
-#                         (see the env block below), which the upstream
-#                         install writes directly into app_data.
+#
+# User files (the ``datadirectory``: every user's uploads, plus
+# nextcloud.log and the preview appdata) do NOT live on app_data — they
+# live on the S3-backed ARCHIVE tier (see PERSIST_DATA_DIR / ARCHIVE_DIR
+# below and the env block).  They are therefore NOT part of this
+# copy-in/copy-out set: the archive is its own durable store and is
+# mounted directly into the container, so nothing about it needs
+# rebuild-time copying.
 #
 # We use a COPY-IN / COPY-OUT scheme rather than symlinks.  Symlinks
 # do not survive the upstream entrypoint: its top-level
@@ -135,7 +159,13 @@ log "DATA_DIR=$DATA_DIR"
 # version.php symlink with a real file.  Both were verified
 # empirically.  Copy-in before the entrypoint runs, copy-out after
 # it has settled (persist_html_state_out, called once Apache is up).
-PERSIST_DATA_DIR="$HTML_PERSIST/data"
+# Nextcloud's user-file data directory lives on the ARCHIVE tier
+# (S3-backed), NOT on local app_data.  This is the whole point of this
+# app declaring ``app_archive = true``: user uploads scale to object
+# storage and don't bloat the local disk or the restic backup.  We give
+# Nextcloud its own subdirectory of the archive mount so a future
+# co-tenant of the same archive namespace can't collide.
+PERSIST_DATA_DIR="$ARCHIVE_DIR/data"
 PERSIST_DIRS=(custom_apps themes)
 
 # Copy persistent state INTO the fresh volume before the upstream
@@ -153,6 +183,26 @@ persist_html_state_in() {
     # succeeds and is required for the install to proceed
     # ("Cannot create or write into the data directory ...").
     chown -R www-data:www-data "$HTML_PERSIST" 2>/dev/null || true
+    # The user-file data dir lives on the archive mount (a separate mount
+    # from HTML_PERSIST).  www-data must own it AND its contents — not just
+    # for uploads under ``<user>/files`` but also for Nextcloud's own
+    # ``appdata_<instanceid>`` (JS/preview caches it writes on the fly, e.g.
+    # when rendering a public share page).  Shallow-chown the parent dirs
+    # first so provisioning can create children.  Then, ONLY when the tree
+    # is not already www-data-owned, chown it recursively: this repairs the
+    # 0:0 ownership left by a platform-side ``local``->S3 migration (whose
+    # copy runs as namespace-root), while avoiding a slow deep -R over the
+    # S3-backed FS on every normal boot (where ownership is already right).
+    chown www-data:www-data "$ARCHIVE_DIR" "$PERSIST_DATA_DIR" 2>/dev/null || true
+    if [[ -d "$PERSIST_DATA_DIR" ]]; then
+        # ``find -not -user www-data -print -quit`` returns a line iff at
+        # least one entry has the wrong owner — a cheap early-exit probe
+        # that doesn't walk the whole tree when everything is already fine.
+        if [[ -n "$(find "$PERSIST_DATA_DIR" -not -user www-data -print -quit 2>/dev/null)" ]]; then
+            log "archive data dir has non-www-data entries (e.g. after a local->S3 migration); chowning recursively"
+            chown -R www-data:www-data "$PERSIST_DATA_DIR" 2>/dev/null || true
+        fi
+    fi
 
     # Populate the Nextcloud CORE CODE into the fresh volume ourselves.
     #
@@ -611,13 +661,13 @@ export REDIS_HOST="127.0.0.1"
 export REDIS_HOST_PORT="6379"
 export NEXTCLOUD_ADMIN_USER="${NEXTCLOUD_ADMIN_USER:-admin}"
 export NEXTCLOUD_ADMIN_PASSWORD
-# Persist user data in app_data (NOT the ephemeral /var/www/html
-# volume).  The upstream entrypoint passes this to
-# ``occ maintenance:install --data-dir`` on first boot and, once
-# config.php records ``datadirectory``, Nextcloud keeps using it on
-# every subsequent boot regardless of this env var — but we keep
-# exporting it so a from-scratch reinstall (wiped app_data) lands in
-# the right place too.
+# User-file data dir lives on the S3-backed ARCHIVE tier (see
+# PERSIST_DATA_DIR / ARCHIVE_DIR above), NOT on the ephemeral
+# /var/www/html volume or local app_data.  The upstream entrypoint
+# passes this to ``occ maintenance:install --data-dir`` on first boot
+# and, once config.php records ``datadirectory``, Nextcloud keeps using
+# it on every subsequent boot regardless of this env var — but we keep
+# exporting it so a from-scratch reinstall lands in the right place too.
 export NEXTCLOUD_DATA_DIR="$PERSIST_DATA_DIR"
 # trusted_domains: the public hostname.  We add 127.0.0.1 too so
 # health-check probes from inside the container don't get rejected.
@@ -644,6 +694,24 @@ export APACHE_DISABLE_REWRITE_IP="1"
 # Surface the domain to before-starting hooks so they can re-stamp
 # overwrite.* idempotently on every boot.
 export OPENHOST_NEXTCLOUD_DOMAIN="$DOMAIN"
+
+# ---------------------------------------------------------------------
+# Start the auth-proxy FIRST, before the (slow) Nextcloud first-boot
+# install.  The proxy is what listens on the OpenHost-routed port
+# (:8080), and OpenHost's readiness probe polls that port with only a
+# ~60s deadline.  Nextcloud's first boot (Postgres init + install + SSO
+# config + pre-installing the Hub extensions) runs well past 60s, so if
+# the proxy only started AFTER Apache was ready the app would be marked
+# "error: App started but not responding to HTTP" every first boot even
+# though it comes up fine minutes later.
+#
+# The proxy serves /_healthz and a cold-start placeholder on "/" while
+# Apache (127.0.0.1:$APACHE_PORT) is still unreachable, so the readiness
+# probe passes immediately; once Apache binds, real traffic flows
+# through.  The proxy has no start-time dependency on Apache being up.
+log "starting auth-proxy on :${AUTH_PROXY_LISTEN_PORT:-8080} (before nextcloud install)"
+python3 /usr/local/bin/auth_proxy.py &
+PROXY_PID=$!
 
 log "starting nextcloud (apache2-foreground via upstream entrypoint)"
 # The upstream ENTRYPOINT script runs install/upgrade hooks (which
@@ -697,9 +765,10 @@ fi
 # (see persist_html_state_in at the top of this script).
 persist_html_state_out
 
-log "starting auth-proxy on :${AUTH_PROXY_LISTEN_PORT:-8080}"
-python3 /usr/local/bin/auth_proxy.py &
-PROXY_PID=$!
+# (The auth-proxy was already started above, before the Nextcloud
+# install, so it could answer OpenHost's readiness probe during the
+# slow first boot.  It is now transparently forwarding to the
+# now-ready Apache.)
 
 # Postgres was started via ``pg_ctl start`` so it's NOT a direct child
 # of this shell — ``wait -n`` cannot see it die.  Without intervention,

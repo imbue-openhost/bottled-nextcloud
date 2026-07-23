@@ -33,16 +33,26 @@ memory_mb = 1536
 cpu_millicores = 1500
 
 [data]
-# Persistent: Postgres data, the generated postgres/admin passwords,
-# and Nextcloud's own state under ``$OPENHOST_APP_DATA_DIR/html``
-# (config.php, version.php, user data/, custom_apps/, themes/).  The
-# upstream image mounts /var/www/html as an anonymous podman VOLUME,
-# which OpenHost does NOT persist across rebuilds, so start.sh keeps
-# that state in app_data and copies it into the fresh volume on each
-# boot (see the README's persistence section).  The auth-sidecar
-# needs no persistent state of its own — owner status comes from the
-# router-stamped ``X-OpenHost-Is-Owner`` header on each request.
+# Persistent (local disk): Postgres data, the generated postgres/admin
+# passwords, and Nextcloud's own state under
+# ``$OPENHOST_APP_DATA_DIR/html`` (config.php, version.php,
+# custom_apps/, themes/).  The upstream image mounts /var/www/html as
+# an anonymous podman VOLUME, which OpenHost does NOT persist across
+# rebuilds, so start.sh keeps that state in app_data and copies it into
+# the fresh volume on each boot (see the README's persistence section).
+# Postgres and config.php REQUIRE local disk (SQLite/WAL-style fsync
+# semantics, low latency) — they must never move to the archive tier.
 app_data = true
-# Per-boot scratch: Apache logs, Postgres logs, Redis runtime state,
-# socket dirs.  Survives crashes but not redeploys.
+# Per-boot scratch (local disk): Apache logs, Postgres logs, Redis
+# runtime state, socket dirs, and Nextcloud's ``tempdirectory``
+# (chunked-upload assembly, file conversions).  Survives crashes but
+# not redeploys.
 app_temp_data = true
+# Archive tier (S3-backed via JuiceFS): Nextcloud's user-file data
+# directory (``datadirectory``) lives here so uploads scale elastically
+# to object storage instead of being capped by, and bloating backups
+# of, the local app_data disk.  This is the flagship use for the
+# archive tier (bulk user content).  NOTE: because this is set,
+# OpenHost will REFUSE to install or reload this app until the operator
+# has configured the zone's S3 archive backend from the dashboard.
+app_archive = true
