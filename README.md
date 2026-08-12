@@ -1,7 +1,7 @@
-# openhost-nextcloud
+# bottled-nextcloud
 
-Nextcloud (files / calendar / contacts / etc.) packaged as an OpenHost
-app, with single sign-on driven by the OpenHost router's
+Nextcloud (files / calendar / contacts / etc.) packaged as a Cloud in a Bottle
+app, with single sign-on driven by the Cloud in a Bottle router's
 `X-OpenHost-Is-Owner` trusted header.
 
 ## What you get
@@ -18,7 +18,7 @@ app, with single sign-on driven by the OpenHost router's
     Apache/PHP (running as `www-data`) is added to the `redis` group
     so it can open the 0770 socket.
   - A small Python auth-sidecar in front of Apache that bridges
-    OpenHost's owner signal (the `X-OpenHost-Is-Owner` header) to
+    Cloud in a Bottle's owner signal (the `X-OpenHost-Is-Owner` header) to
     Nextcloud's `user_saml` app in environment-variable mode
   - tini as PID 1 to reap zombies and forward signals
 - Persistent state under `$OPENHOST_APP_DATA_DIR`:
@@ -30,7 +30,7 @@ app, with single sign-on driven by the OpenHost router's
     backend only.
   - `html/` — Nextcloud's persisted application state.  The upstream
     image mounts `/var/www/html` as an anonymous podman VOLUME, which
-    OpenHost does NOT persist across container rebuilds, so we keep
+    Cloud in a Bottle does NOT persist across container rebuilds, so we keep
     the pieces that must survive a rebuild here instead:
     `html/config.php` (config.php with DB creds, instanceid, secret,
     the user_saml settings), `html/version.php` (drives the upstream
@@ -54,7 +54,7 @@ app, with single sign-on driven by the OpenHost router's
   need fast fsync semantics and must never move to the archive), and
   Nextcloud's scratch `tempdirectory` (chunked-upload assembly, file
   conversions) is pinned to local `app_temp_data`. **Because
-  `app_archive = true`, OpenHost refuses to install/reload this app
+  `app_archive = true`, Cloud in a Bottle refuses to install/reload this app
   until the zone's S3 archive backend is configured from the
   dashboard.**
   - `.postgres_password` — chmod 644.  Regenerated only when the
@@ -76,15 +76,15 @@ app, with single sign-on driven by the OpenHost router's
 
 There are TWO authentication rails because Nextcloud's native sync
 clients (Desktop / Android / iOS / WebDAV CLIs) do not carry the
-OpenHost owner session:
+Cloud in a Bottle owner session:
 
 ### Rail 1: web UI (browser)
 
-1. The owner arrives at `nextcloud.<zone-domain>`. The OpenHost router
+1. The owner arrives at `nextcloud.<zone-domain>`. The Cloud in a Bottle router
    authenticates the owner via their zone `session_token` cookie and,
    on success, stamps `X-OpenHost-Is-Owner: true` on the request it
    forwards to the container.
-2. The OpenHost router treats every path under this app as
+2. The Cloud in a Bottle router treats every path under this app as
    "public" (`public_paths = ["/"]` in `openhost.toml`) so the
    request reaches the auth-sidecar inside the container even when the
    visitor is not the owner (needed for native-sync and public-share
@@ -109,7 +109,7 @@ log in via the bootstrap admin password (saved to
 
 > **Note on the previous JWT approach.** Earlier revisions verified a
 > router-signed `zone_auth` JWT cookie against the router's JWKS
-> endpoint. Current OpenHost does not mint a `zone_auth` cookie for
+> endpoint. Current Cloud in a Bottle does not mint a `zone_auth` cookie for
 > apps at all — the trusted `X-OpenHost-Is-Owner` header is the only
 > owner signal — so relying on the (nonexistent) JWT left the owner
 > permanently unable to sign in ("Account not provisioned"). The
@@ -121,7 +121,7 @@ log in via the bootstrap admin password (saved to
 1. The user opens the Nextcloud Desktop / Android / iOS app and
    chooses "log in" with the URL `https://nextcloud.<zone-domain>`.
 2. The client opens Login Flow v2 in the system browser. The system
-   browser already carries the owner's OpenHost session, so the
+   browser already carries the owner's Cloud in a Bottle session, so the
    router stamps `X-OpenHost-Is-Owner: true`, the auth-sidecar
    recognises the owner, and the Login Flow v2 pages SSO straight
    through.
@@ -148,10 +148,10 @@ support per-app permissions (e.g. read-only).
 
 ### Why `public_paths = ["/"]` is safe
 
-`public_paths = ["/"]` tells the **OpenHost router** that no path
+`public_paths = ["/"]` tells the **Cloud in a Bottle router** that no path
 under this app requires an authenticated owner at the router layer —
 so anonymous native-sync clients and public-share visitors are not
-bounced to the OpenHost `/login` page and can reach Nextcloud
+bounced to the Cloud in a Bottle `/login` page and can reach Nextcloud
 directly.
 
 Trusting the `X-OpenHost-Is-Owner` header is safe because the router
@@ -170,7 +170,7 @@ public-share visitor is never auto-logged-in as the owner.
 
 ## First boot / installation
 
-OpenHost will pull the image and start the container. On first boot
+Cloud in a Bottle will pull the image and start the container. On first boot
 `start.sh` seeds the Nextcloud core code into the fresh
 `/var/www/html` volume and finds no persisted `config.php`/`version.php`
 in `$OPENHOST_APP_DATA_DIR/html`, so the upstream entrypoint runs
@@ -233,7 +233,7 @@ the extras. Any extension you install later from the web UI also
 persists across rebuilds: it lands in `custom_apps/`, which is copied
 out to `$OPENHOST_APP_DATA_DIR/html` both once per boot (after Apache
 starts) and again on graceful shutdown (the `SIGTERM` teardown path in
-`start.sh`), so a normal OpenHost stop/redeploy captures it. A hard
+`start.sh`), so a normal Cloud in a Bottle stop/redeploy captures it. A hard
 kill (ungraceful host crash) between installing an app and the next
 graceful stop is the only case where a freshly-installed extension
 could be lost on the following rebuild.
@@ -256,7 +256,7 @@ Persistent state lives under `$OPENHOST_APP_DATA_DIR`:
 - **User files** live on the S3-backed archive tier
   (`$OPENHOST_APP_ARCHIVE_DIR/data`), NOT under `$OPENHOST_APP_DATA_DIR`.
   Their durability is whatever the operator's configured S3 provider
-  offers; the OpenHost backup app deliberately excludes the archive
+  offers; the Cloud in a Bottle backup app deliberately excludes the archive
   tier from restic snapshots (it is already durable object storage).
   Back it up, if you want a second copy, via your S3 provider's own
   versioning/replication.
@@ -287,33 +287,33 @@ Upgrades happen only by rebuilding the image with a newer base.
 | `APACHE_PORT` | `8081` | The port Apache binds inside the container; the auth-sidecar proxies to `127.0.0.1:$APACHE_PORT`. The value is baked into Apache's `ports.conf` and the default vhost at build time via `sed`, AND read at runtime by `start.sh` (for the readiness probe) and `auth_proxy.py` (for the upstream target). Setting this at runtime changes only the readiness probe and proxy target — Apache itself is still bound to the build-time value, so a runtime override would point the proxy at a port nothing is listening on. **Effectively build-time only.** Operators wanting a different port must rebuild the image. |
 | `APACHE_READY_TIMEOUT` | `90` | Seconds to wait for Apache to bind its listening port before declaring startup failed. |
 | `REDIS_READY_TIMEOUT` | `30` | Seconds to wait for Redis to respond to PING before declaring startup failed. |
-| `PG_WATCHDOG_INTERVAL` | `15` | Seconds between Postgres `pg_isready` probes. Three consecutive failures terminate the container so OpenHost restarts it. |
+| `PG_WATCHDOG_INTERVAL` | `15` | Seconds between Postgres `pg_isready` probes. Three consecutive failures terminate the container so Cloud in a Bottle restarts it. |
 | `AUTH_PROXY_LOG_LEVEL` | `INFO` | Python logging level for the sidecar. Set to `DEBUG` for verbose per-request logging (helpful for diagnosing routing/SSO issues). |
 
-The following variables are set by OpenHost itself and consumed
+The following variables are set by Cloud in a Bottle itself and consumed
 internally by `start.sh`, the auth-sidecar, and the hooks; they're
 listed here so you don't have to read the source to understand
 what's happening:
 
 | Var | Source | Purpose |
 | --- | --- | --- |
-| `OPENHOST_ZONE_DOMAIN` | OpenHost runtime | The zone's public domain. Used to derive `NEXTCLOUD_DOMAIN`. |
-| `OPENHOST_APP_NAME` | OpenHost runtime | This app's name (`nextcloud`). Used to derive `NEXTCLOUD_DOMAIN`. |
-| `OPENHOST_APP_DATA_DIR` | OpenHost runtime | The persistent-data directory. Defaults to `/var/lib/openhost-nextcloud` if unset (which only happens in standalone testing). |
-| `OPENHOST_APP_TEMP_DIR` | OpenHost runtime | Per-boot scratch directory; redis.conf is written here. (The legacy name `OPENHOST_APP_TEMP_DATA_DIR` is also accepted as a fallback.) |
+| `OPENHOST_ZONE_DOMAIN` | Cloud in a Bottle runtime | The zone's public domain. Used to derive `NEXTCLOUD_DOMAIN`. |
+| `OPENHOST_APP_NAME` | Cloud in a Bottle runtime | This app's name (`nextcloud`). Used to derive `NEXTCLOUD_DOMAIN`. |
+| `OPENHOST_APP_DATA_DIR` | Cloud in a Bottle runtime | The persistent-data directory. Defaults to `/var/lib/openhost-nextcloud` if unset (which only happens in standalone testing). |
+| `OPENHOST_APP_TEMP_DIR` | Cloud in a Bottle runtime | Per-boot scratch directory; redis.conf is written here. (The legacy name `OPENHOST_APP_TEMP_DATA_DIR` is also accepted as a fallback.) |
 | `OPENHOST_NEXTCLOUD_DOMAIN` | exported by `start.sh` | The resolved public hostname. The before-starting hook reads this to re-stamp `trusted_*` and `overwrite.*`. |
 
 The Nextcloud image's standard env vars (`POSTGRES_*`, `REDIS_*`,
 `NEXTCLOUD_TRUSTED_DOMAINS`, `TRUSTED_PROXIES`, `OVERWRITEHOST`,
 `OVERWRITEPROTOCOL`, `OVERWRITECLIURL`) are set automatically by
-`start.sh`. Do not override them through the OpenHost UI unless you
+`start.sh`. Do not override them through the Cloud in a Bottle UI unless you
 also know how Nextcloud's first-install flow consumes them.
 
 ## Caveats
 
-- **One major upgrade at a time** (Nextcloud rule, not OpenHost).
+- **One major upgrade at a time** (Nextcloud rule, not Cloud in a Bottle).
 - **App passwords for sync clients can't be revoked from outside
-  Nextcloud.** If you end the zone owner's OpenHost session, the web
+  Nextcloud.** If you end the zone owner's Cloud in a Bottle session, the web
   UI logs them out immediately, but app passwords minted earlier
   remain valid until manually revoked via Settings → Security.
   This is the architectural reason this app maxes out at integration
@@ -324,7 +324,7 @@ also know how Nextcloud's first-install flow consumes them.
   process its background queue. The web UI's "background jobs"
   status page may warn about this; ignore the warning unless you
   have a specific reason to want strict cron timing.
-- **PostgreSQL data integrity on shutdown.** OpenHost sends SIGTERM
+- **PostgreSQL data integrity on shutdown.** Cloud in a Bottle sends SIGTERM
   on stop; the supervisor traps it and runs `pg_ctl stop -m fast`.
   A SIGKILL (e.g. ungraceful host crash) skips that and Postgres
   recovers from WAL on next boot — no data loss but the first
