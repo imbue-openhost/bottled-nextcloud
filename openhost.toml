@@ -1,7 +1,7 @@
 [app]
 name = "nextcloud"
 version = "0.1.0"
-description = "Nextcloud (files / calendar / contacts) with OpenHost owner single sign-on"
+description = "Nextcloud (files / calendar / contacts) with Cloud in a Bottle owner single sign-on"
 authors = ["Andrew Laack <andrew@laack.co>"]
 
 [runtime.container]
