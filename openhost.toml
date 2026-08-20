@@ -30,6 +30,11 @@ public_paths = ["/"]
 # with a few TB of data.  Bump if running Talk (video calls) or
 # OnlyOffice — neither is shipped here.
 memory_mb = 1536
+# Measured clean --no-cache build peak ~2405 MiB (2.35 GiB), from the
+# nextcloud base image plus apt-get install of PHP/system deps. Runtime
+# memory_mb (1536) is lower, so without an explicit build cap the build
+# can OOM. Sized to the measured peak rounded up to the next 0.5 GiB.
+build_memory_mb = 2560
 cpu_millicores = 1500
 
 [data]
